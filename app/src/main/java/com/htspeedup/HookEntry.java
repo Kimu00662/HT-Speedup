@@ -98,11 +98,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         "settle_center",
     };
 
-    private static volatile long lastUserinfoTs = 0;
-    private static final long USERINFO_DEDUP_MS = 10_000;
+    // userinfo 按 body 指纹去重（区分自己/对方），to-user-chat 按完整 URL 去重
+    private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
+    private static final long USERINFO_DEDUP_MS = 15_000;
 
-    private static volatile long lastToUserChatTs = 0;
-    private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
+    private static final ConcurrentHashMap<String, Long> toUserChatDedup = new ConcurrentHashMap<>();
+    private static final long TO_USER_CHAT_DEDUP_MS = 15_000;
 
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
@@ -184,7 +185,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object request = param.args[0];
                         String u = getUrlFromRequest(request);
                         if (u == null) return;
-                        if (shouldBlockUrl(u)) {
+                        if (shouldBlock(u, request)) {
                             param.setThrowable(new IOException(TAG + " blocked via newCall"));
                         }
                     } catch (Throwable t) {
@@ -198,26 +199,30 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。集中处理白名单/去重/黑名单。 */
-    private static boolean shouldBlockUrl(String u) {
+    /** 返回 true 表示应拦截。u=URL，request=Request对象（用于 body 指纹）。 */
+    private static boolean shouldBlock(String u, Object request) {
         // IM 长连接，放行
         if (u.contains("ht_im/sock")) return false;
 
-        // to-user-chat 去重：10 秒内只放行第一次（秒进的关键）
+        // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
         if (u.contains("p2p-chat/to-user-chat")) {
             long now = System.currentTimeMillis();
-            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
-            lastToUserChatTs = now;
+            Long last = toUserChatDedup.get(u);
+            if (last != null && now - last < TO_USER_CHAT_DEDUP_MS) return true;
+            toUserChatDedup.put(u, now);
             return false;
         }
 
-        // userinfo 去重：10 秒内只放行第一次。
+        // userinfo 按 body 指纹去重：自己/对方各自放行首次，后续重复才拦截。
         // 在线状态由 IM 推送实时写库（标题栏走 mode=1 缓存读本地 DB），
-        // 所以 HTTP 层去重拦截不会导致在线状态失真，反而带来秒进。
+        // 所以 HTTP 层去重不会导致在线状态失真，反而带来秒进。
         if (u.contains("profile/v2/userinfo")) {
+            String fp = getBodyFingerprint(request);
+            String key = (fp != null) ? fp : u;
             long now = System.currentTimeMillis();
-            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) return true;
-            lastUserinfoTs = now;
+            Long last = userinfoDedup.get(key);
+            if (last != null && now - last < USERINFO_DEDUP_MS) return true;
+            userinfoDedup.put(key, now);
             return false;
         }
 
@@ -253,12 +258,14 @@ public class HookEntry implements IXposedHookLoadPackage {
                     if ("execute".equals(param.method.getName())) {
                         return;
                     }
-                    String u = getUrlFromRealCall(param.thisObject);
-                    if (u == null) {
+                    Object request = getRequestFromRealCall(param.thisObject);
+                    if (request == null) {
                         logRealCallDiagnosticsOnce(param.thisObject);
                         return;
                     }
-                    boolean block = shouldBlockUrl(u);
+                    String u = getUrlFromRequest(request);
+                    if (u == null) return;
+                    boolean block = shouldBlock(u, request);
                     logUrlOnce(u, block, param.method.getName());
                     if (block) {
                         blockRequest(param);
@@ -344,26 +351,70 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String getUrlFromRealCall(Object call) {
+        return getUrlFromRequest(getRequestFromRealCall(call));
+    }
+
+    private static Object getRequestFromRealCall(Object call) {
         if (call == null) return null;
-        // request() 方法拿 Request 对象，再取完整 URL（含路径）
         try {
             Object req = XposedHelpers.callMethod(call, "request");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
-        // getOriginalRequest()
         try {
             Object req = XposedHelpers.callMethod(call, "getOriginalRequest");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
-        // originalRequest 字段
         try {
             Object req = XposedHelpers.getObjectField(call, "originalRequest");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    /** 从 Request 对象提取 body 字节指纹（前32字节hex+长度），用于 userinfo 按内容区分去重。 */
+    private static String getBodyFingerprint(Object request) {
+        if (request == null) return null;
+        try {
+            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    f.setAccessible(true);
+                    Object v;
+                    try { v = f.get(request); } catch (Throwable ignored) { continue; }
+                    if (v == null) continue;
+                    String hex = extractBytesFingerprint(v);
+                    if (hex != null) return hex;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String extractBytesFingerprint(Object obj) {
+        if (obj == null) return null;
+        if (obj instanceof byte[]) {
+            return bytesToFingerprint((byte[]) obj);
+        }
+        try {
+            for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType() == byte[].class) {
+                        f.setAccessible(true);
+                        byte[] b = (byte[]) f.get(obj);
+                        if (b != null && b.length > 0) return bytesToFingerprint(b);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String bytesToFingerprint(byte[] b) {
+        int n = Math.min(32, b.length);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            sb.append(String.format("%02x", b[i]));
+        }
+        return sb.append('#').append(b.length).toString();
     }
 
     private static volatile boolean diagLogged = false;
