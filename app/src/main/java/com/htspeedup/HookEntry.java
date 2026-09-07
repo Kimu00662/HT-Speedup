@@ -216,7 +216,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                         logRealCallDiagnosticsOnce(param.thisObject);
                         return;
                     }
-                    if (shouldBlockUrl(u)) {
+                    boolean block = shouldBlockUrl(u);
+                    logUrlOnce(u, block, param.method.getName());
+                    if (block) {
                         blockRequest(param);
                     }
                 } catch (Throwable t) {
@@ -307,6 +309,15 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static volatile boolean diagLogged = false;
+    private static volatile int urlLogCount = 0;
+    private static final int URL_LOG_LIMIT = 30;
+
+    private static void logUrlOnce(String url, boolean block, String method) {
+        if (urlLogCount >= URL_LOG_LIMIT) return;
+        urlLogCount++;
+        String shortUrl = url.length() > 80 ? url.substring(0, 80) + "..." : url;
+        XposedBridge.log(TAG + " [" + method + "] block=" + block + " url=" + shortUrl);
+    }
 
     private static void logRealCallDiagnosticsOnce(Object call) {
         if (diagLogged || call == null) return;
