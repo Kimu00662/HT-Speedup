@@ -250,10 +250,13 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static String getUrlFromRequest(Object request) {
         if (request == null) return null;
-        // OkHttp 4.x Kotlin: url() 方法返回 HttpUrl
+        // OkHttp 4.x Kotlin: url() 方法返回 HttpUrl，toString() 含完整路径
         try {
             Object url = XposedHelpers.callMethod(request, "url");
-            if (url != null) return url.toString();
+            if (url != null) {
+                String s = url.toString();
+                if (s != null && s.length() > 0) return s;
+            }
         } catch (Throwable ignored) {}
         // getUrl()
         try {
@@ -282,12 +285,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static String getUrlFromRealCall(Object call) {
         if (call == null) return null;
-        // OkHttp 4.x 内部方法，直接返回 URL 字符串，最可靠
-        try {
-            Object u = XposedHelpers.callMethod(call, "redactedUrl$okhttp");
-            if (u != null) return u.toString();
-        } catch (Throwable ignored) {}
-        // request() 方法
+        // request() 方法拿 Request 对象，再取完整 URL（含路径）
         try {
             Object req = XposedHelpers.callMethod(call, "request");
             String u = getUrlFromRequest(req);
