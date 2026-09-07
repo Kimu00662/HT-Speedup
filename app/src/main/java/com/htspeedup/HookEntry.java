@@ -143,53 +143,50 @@ public class HookEntry implements IXposedHookLoadPackage {
     private void hookNewCall(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> clientClass = XposedHelpers.findClass("okhttp3.OkHttpClient", lpp.classLoader);
-            Class<?> requestClass = XposedHelpers.findClass("okhttp3.Request", lpp.classLoader);
-
-            XposedHelpers.findAndHookMethod(clientClass, "newCall", requestClass, new XC_MethodHook() {
+            int n = XposedBridge.hookAllMethods(clientClass, "newCall", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
+                        if (param.args == null || param.args.length == 0) return;
                         Object request = param.args[0];
                         String u = getUrlFromRequest(request);
                         if (u == null) return;
-
-                        if (u.contains("ht_im/sock")) return;
-
-                        if (u.contains("p2p-chat/to-user-chat")) {
-                            long now = System.currentTimeMillis();
-                            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) {
-                                param.setThrowable(new IOException(TAG + " blocked to-user-chat"));
-                                return;
-                            }
-                            lastToUserChatTs = now;
-                            return;
-                        }
-
-                        if (u.contains("profile/v2/userinfo")) {
-                            long now = System.currentTimeMillis();
-                            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) {
-                                param.setThrowable(new IOException(TAG + " blocked userinfo"));
-                                return;
-                            }
-                            lastUserinfoTs = now;
-                            return;
-                        }
-
-                        for (String p : BLOCK_PATHS) {
-                            if (u.contains(p)) {
-                                param.setThrowable(new IOException(TAG + " blocked " + p));
-                                return;
-                            }
+                        if (shouldBlockUrl(u)) {
+                            param.setThrowable(new IOException(TAG + " blocked via newCall"));
                         }
                     } catch (Throwable t) {
                         XposedBridge.log(TAG + " newCall hook 异常: " + t.getMessage());
                     }
                 }
-            });
-            XposedBridge.log(TAG + " hook OkHttpClient.newCall 成功");
+            }).size();
+            XposedBridge.log(TAG + " hook OkHttpClient.newCall(hookAll) 命中方法数=" + n);
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook newCall 失败: " + t.getMessage());
         }
+    }
+
+    /** 返回 true 表示应拦截。集中处理白名单/去重/黑名单。 */
+    private static boolean shouldBlockUrl(String u) {
+        if (u.contains("ht_im/sock")) return false;
+
+        if (u.contains("p2p-chat/to-user-chat")) {
+            long now = System.currentTimeMillis();
+            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
+            lastToUserChatTs = now;
+            return false;
+        }
+
+        if (u.contains("profile/v2/userinfo")) {
+            long now = System.currentTimeMillis();
+            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) return true;
+            lastUserinfoTs = now;
+            return false;
+        }
+
+        for (String p : BLOCK_PATHS) {
+            if (u.contains(p)) return true;
+        }
+        return false;
     }
 
     private void hookRealCall(XC_LoadPackage.LoadPackageParam lpp) {
@@ -215,35 +212,12 @@ public class HookEntry implements IXposedHookLoadPackage {
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
                     String u = getUrlFromRealCall(param.thisObject);
-                    if (u == null) return;
-
-                    if (u.contains("ht_im/sock")) return;
-
-                    if (u.contains("p2p-chat/to-user-chat")) {
-                        long now = System.currentTimeMillis();
-                        if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) {
-                            blockRequest(param);
-                            return;
-                        }
-                        lastToUserChatTs = now;
+                    if (u == null) {
+                        logRealCallDiagnosticsOnce(param.thisObject);
                         return;
                     }
-
-                    if (u.contains("profile/v2/userinfo")) {
-                        long now = System.currentTimeMillis();
-                        if (now - lastUserinfoTs < USERINFO_DEDUP_MS) {
-                            blockRequest(param);
-                            return;
-                        }
-                        lastUserinfoTs = now;
-                        return;
-                    }
-
-                    for (String p : BLOCK_PATHS) {
-                        if (u.contains(p)) {
-                            blockRequest(param);
-                            return;
-                        }
+                    if (shouldBlockUrl(u)) {
+                        blockRequest(param);
                     }
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + " RealCall hook 异常: " + t.getMessage());
@@ -312,7 +286,47 @@ public class HookEntry implements IXposedHookLoadPackage {
             String u = getUrlFromRequest(req);
             if (u != null) return u;
         } catch (Throwable ignored) {}
+        // 遍历所有字段，找类型为 okhttp3.Request 的对象
+        try {
+            Class<?> reqClass = XposedHelpers.findClass("okhttp3.Request", call.getClass().getClassLoader());
+            for (Class<?> c = call.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (reqClass.isAssignableFrom(f.getType())) {
+                        f.setAccessible(true);
+                        Object req = f.get(call);
+                        String u = getUrlFromRequest(req);
+                        if (u != null) return u;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static volatile boolean diagLogged = false;
+
+    private static void logRealCallDiagnosticsOnce(Object call) {
+        if (diagLogged || call == null) return;
+        diagLogged = true;
+        try {
+            StringBuilder sb = new StringBuilder(TAG + " 诊断 RealCall 类=" + call.getClass().getName());
+            sb.append("\n  方法:");
+            for (java.lang.reflect.Method m : call.getClass().getMethods()) {
+                String n = m.getName();
+                if (n.contains("equest") || n.equals("url") || n.contains("Url")) {
+                    sb.append(' ').append(n).append('(').append(m.getParameterTypes().length).append(")=").append(m.getReturnType().getSimpleName());
+                }
+            }
+            sb.append("\n  字段:");
+            for (Class<?> c = call.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    sb.append(' ').append(f.getName()).append(':').append(f.getType().getSimpleName());
+                }
+            }
+            XposedBridge.log(sb.toString());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " 诊断失败: " + t.getMessage());
+        }
     }
 
     private void hookChatPage(XC_LoadPackage.LoadPackageParam lpp) {
