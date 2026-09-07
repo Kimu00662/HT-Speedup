@@ -1,6 +1,7 @@
 package com.htspeedup;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -106,7 +107,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     // userinfo 按 body 指纹去重：body 指纹 -> 上次放行时间
     private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
-    private static final long USERINFO_DEDUP_MS = 300000;
+    private static final long USERINFO_DEDUP_MS = 3000;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -444,8 +445,9 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param, String url) {
         if (url != null && url.contains("profile/v2/userinfo")) {
-            // userinfo 去重拦截：调 onFailure 让 app 走本地缓存兜底（断网时秒进显示头像星座的机制）
-            IOException ex = new IOException(TAG + " dedup");
+            // userinfo 去重拦截：抛 ConnectException 模拟断网，触发 app 缓存兜底
+            // （断网时 app 秒进显示头像星座正是此机制；普通 IOException 会导致 app 清空 UI 数据）
+            ConnectException ex = new ConnectException(TAG + " dedup");
             try {
                 XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
             } catch (Throwable ignored) {}
