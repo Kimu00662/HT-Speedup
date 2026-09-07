@@ -250,24 +250,42 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static String getUrlFromRequest(Object request) {
         if (request == null) return null;
-        // OkHttp 4.x Kotlin: url() 方法返回 HttpUrl，toString() 含完整路径
+        // 最简单可靠：Request.toString() 打印 Request{method=GET, url=..., headers=[...]}
+        // toString 是 Object 方法，R8 不会混淆，url= 后面的就是完整 URL
         try {
-            Object url = XposedHelpers.callMethod(request, "url");
-            if (url != null) {
-                String s = url.toString();
-                if (s != null && s.length() > 0) return s;
+            String s = request.toString();
+            if (s != null) {
+                int u = s.indexOf("url=");
+                if (u >= 0) {
+                    int end = s.indexOf(", ", u);
+                    if (end < 0) end = s.length();
+                    String url = s.substring(u + 4, end);
+                    if (url.startsWith("http")) return url;
+                }
             }
         } catch (Throwable ignored) {}
-        // getUrl()
-        try {
-            Object url = XposedHelpers.callMethod(request, "getUrl");
-            if (url != null) return url.toString();
-        } catch (Throwable ignored) {}
-        // 直接读字段
-        try {
-            Object url = XposedHelpers.getObjectField(request, "url");
-            if (url != null) return url.toString();
-        } catch (Throwable ignored) {}
+        // OkHttp 4.x Kotlin: url() 方法（可能被混淆成 a()）
+        String[] urlMethods = {"url", "getUrl", "a"};
+        for (String m : urlMethods) {
+            try {
+                Object url = XposedHelpers.callMethod(request, m);
+                if (url != null) {
+                    String s = url.toString();
+                    if (s != null && s.startsWith("http")) return s;
+                }
+            } catch (Throwable ignored) {}
+        }
+        // 直接读字段（可能被混淆成 a）
+        String[] urlFields = {"url", "a"};
+        for (String f : urlFields) {
+            try {
+                Object url = XposedHelpers.getObjectField(request, f);
+                if (url != null) {
+                    String s = url.toString();
+                    if (s != null && s.startsWith("http")) return s;
+                }
+            } catch (Throwable ignored) {}
+        }
         // 遍历字段找 HttpUrl 类型
         try {
             for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
