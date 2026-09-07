@@ -1,7 +1,6 @@
 package com.htspeedup;
 
 import java.io.IOException;
-import java.net.ConnectException;
 import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -105,9 +104,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     };
 
-    // userinfo 按 body 指纹去重：body 指纹 -> 上次放行时间
-    private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
-    private static final long USERINFO_DEDUP_MS = 3000;
+    // UserInfoProvider 走缓存：userId -> 上次网络加载时间（同 userId N 秒内强制走缓存）
+    private static final ConcurrentHashMap<Integer, Long> userinfoLoadTs = new ConcurrentHashMap<>();
+    private static final long USERINFO_CACHE_WINDOW_MS = 10_000;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -116,6 +115,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
+        hookUserInfoProvider(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -135,6 +135,43 @@ public class HookEntry implements IXposedHookLoadPackage {
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook Application 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookUserInfoProvider(XC_LoadPackage.LoadPackageParam lpp) {
+        // UserInfoProvider（混淆名 yrv）是 userinfo 数据的唯一入口，有 loadRam/loadCache/loadNet 三级缓存
+        // 卡顿根源：app 联网时每次进聊天页都走 loadNet（网络），而断网时走 loadCache（秒进）
+        // 修复：hook load 入口（b 方法），同 userId 10 秒内把网络加载（mode=0）改为缓存加载（mode=1）
+        try {
+            Class<?> providerClass = XposedHelpers.findClass("yrv", lpp.classLoader);
+            XposedBridge.hookAllMethods(providerClass, "b", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 3) return;
+                        Object uidObj = param.args[0];
+                        Object modeObj = param.args[2];
+                        if (!(uidObj instanceof Integer) || !(modeObj instanceof Integer)) return;
+                        int uid = (Integer) uidObj;
+                        int mode = (Integer) modeObj;
+                        if (mode != 0) return; // 已是缓存模式，不动
+                        long now = System.currentTimeMillis();
+                        Long last = userinfoLoadTs.get(uid);
+                        if (last != null && now - last < USERINFO_CACHE_WINDOW_MS) {
+                            param.args[2] = 1; // 窗口内强制走缓存
+                            XposedBridge.log(TAG + " userinfo 走缓存 uid=" + uid);
+                        } else {
+                            userinfoLoadTs.put(uid, now);
+                            XposedBridge.log(TAG + " userinfo 走网络 uid=" + uid);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " userinfo provider hook 异常: " + t.getMessage());
+                    }
+                }
+            });
+            XposedBridge.log(TAG + " hook UserInfoProvider.load 成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
         }
     }
 
@@ -163,26 +200,14 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。u=URL，request=Request对象（用于 body 指纹）。 */
+    /** 返回 true 表示应拦截。u=URL，request=Request对象。 */
     private static boolean shouldBlock(String u, Object request) {
         // 以下都是聊天页/个人页展示必需的数据，放行
         if (u.contains("ht_im/sock")) return false;
         if (u.contains("p2p-chat/to-user-chat")) return false;
+        if (u.contains("profile/v2/userinfo")) return false;
         if (u.contains("profile/v1/get_pay_chat_info")) return false;
         if (u.contains("livehub/user/status")) return false;
-
-        // userinfo 按 body 指纹去重：相同 body 2秒内只放行一次，不同 body 各自放行
-        if (u.contains("profile/v2/userinfo")) {
-            String fp = getBodyFingerprint(request);
-            String key = (fp != null) ? fp : u;
-            long now = System.currentTimeMillis();
-            Long last = userinfoDedup.get(key);
-            if (last != null && now - last < USERINFO_DEDUP_MS) {
-                return true; // 相同 body 重复，拦截
-            }
-            userinfoDedup.put(key, now);
-            return false; // 放行第一次
-        }
 
         for (String p : BLOCK_PATHS) {
             if (u.contains(p)) return true;
@@ -329,54 +354,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         return getUrlFromRequest(getRequestFromRealCall(call));
     }
 
-    /** 从 Request 对象提取 body 字节指纹（前32字节hex + 长度），用于 userinfo 按内容去重。 */
-    private static String getBodyFingerprint(Object request) {
-        if (request == null) return null;
-        try {
-            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    f.setAccessible(true);
-                    Object v;
-                    try { v = f.get(request); } catch (Throwable ignored) { continue; }
-                    if (v == null) continue;
-                    String hex = extractBytesFingerprint(v);
-                    if (hex != null) return hex;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static String extractBytesFingerprint(Object obj) {
-        if (obj == null) return null;
-        // 自身就是 byte[]
-        if (obj instanceof byte[]) {
-            return bytesToFingerprint((byte[]) obj);
-        }
-        // 遍历其字段找 byte[]
-        try {
-            for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (f.getType() == byte[].class) {
-                        f.setAccessible(true);
-                        byte[] b = (byte[]) f.get(obj);
-                        if (b != null && b.length > 0) return bytesToFingerprint(b);
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static String bytesToFingerprint(byte[] b) {
-        int n = Math.min(32, b.length);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < n; i++) {
-            sb.append(String.format("%02x", b[i]));
-        }
-        return sb.append('#').append(b.length).toString();
-    }
-
     private static volatile boolean diagLogged = false;
     private static volatile int urlLogCount = 0;
     private static final int URL_LOG_LIMIT = 30;
@@ -444,17 +421,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param, String url) {
-        if (url != null && url.contains("profile/v2/userinfo")) {
-            // userinfo 去重拦截：抛 ConnectException 模拟断网，触发 app 缓存兜底
-            // （断网时 app 秒进显示头像星座正是此机制；普通 IOException 会导致 app 清空 UI 数据）
-            ConnectException ex = new ConnectException(TAG + " dedup");
-            try {
-                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
-            } catch (Throwable ignored) {}
-            param.setResult(null);
-        } else {
-            // 纯冗余请求：静默丢弃，不回调 onFailure（否则 app 弹网络错误提示）
-            param.setResult(null);
-        }
+        // 只处理 enqueue（execute 已在 hook 里提前放行）
+        // 纯冗余请求：静默丢弃，不回调 onFailure（否则 app 弹网络错误提示）
+        param.setResult(null);
     }
 }
