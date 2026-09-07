@@ -63,7 +63,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookUserInfoProviderLoad(lpp);
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
-        hookToast(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -83,66 +82,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook Application 失败: " + t.getMessage());
         }
-    }
-
-    private void hookToast(XC_LoadPackage.LoadPackageParam lpp) {
-        try {
-            Class<?> toastClass = XposedHelpers.findClass("android.widget.Toast", lpp.classLoader);
-            
-            // hook show() 方法，如果包含"错误"字样就不显示
-            XposedBridge.hookAllMethods(toastClass, "show", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object toast = param.thisObject;
-                        Object view = XposedHelpers.getObjectField(toast, "mNextView");
-                        
-                        if (view != null) {
-                            // 尝试从 Toast 的 view 里提取文本
-                            String toastText = extractToastText(view);
-                            
-                            // 如果包含错误/error/fail/network等关键词，就隐藏
-                            if (toastText != null && (
-                                toastText.contains("错误") || 
-                                toastText.contains("error") ||
-                                toastText.contains("Error") ||
-                                toastText.contains("fail") ||
-                                toastText.contains("Fail") ||
-                                toastText.contains("network") ||
-                                toastText.contains("Network") ||
-                                toastText.contains("timeout") ||
-                                toastText.contains("Timeout")
-                            )) {
-                                param.setResult(null);
-                                XposedBridge.log(TAG + " 已隐藏错误提示: " + toastText);
-                            }
-                        }
-                    } catch (Throwable t) {
-                        // ignored
-                    }
-                }
-            });
-            
-            XposedBridge.log(TAG + " hook Toast.show() 成功");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook Toast 失败: " + t.getMessage());
-        }
-    }
-
-    private static String extractToastText(Object view) {
-        try {
-            // Toast 通常在 LinearLayout 里，尝试找 TextView
-            if (view instanceof android.view.ViewGroup) {
-                android.view.ViewGroup group = (android.view.ViewGroup) view;
-                for (int i = 0; i < group.getChildCount(); i++) {
-                    android.view.View child = group.getChildAt(i);
-                    if (child instanceof android.widget.TextView) {
-                        return ((android.widget.TextView) child).getText().toString();
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
     }
 
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
@@ -310,6 +249,9 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean shouldBlockUrl(String u) {
         if (u.contains("ht_im/sock")) return false;
+
+        // ★ 个人资料页的 userinfo 请求必须放行
+        if (u.contains("profile/v2/userinfo")) return false;
 
         if (u.contains("p2p-chat/to-user-chat")) {
             long now = System.currentTimeMillis();
