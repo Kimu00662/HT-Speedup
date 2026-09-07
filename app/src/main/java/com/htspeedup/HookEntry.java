@@ -91,6 +91,11 @@ public class HookEntry implements IXposedHookLoadPackage {
         "translate/v2/sts",
         "cards",
         "magic_wand/main",
+        "get_course_module",
+        "profile_banner",
+        "learn_record",
+        "user_virtual_info",
+        "settle_center",
     };
 
     private static volatile long lastUserinfoTs = 0;
@@ -110,45 +115,106 @@ public class HookEntry implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
         if (!"com.hellotalk".equals(lpp.packageName)) return;
 
-        XposedBridge.log(TAG + " 模块已加载，开始安装钩子");
+        XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
-        hookOkHttp(lpp);
+        hookApplication(lpp);
+        hookNewCall(lpp);
+        hookRealCall(lpp);
         hookChatPage(lpp);
 
-        XposedBridge.log(TAG + " 钩子安装完成");
+        XposedBridge.log(TAG + " ===== 钩子安装完成 =====");
     }
 
-    private void hookOkHttp(XC_LoadPackage.LoadPackageParam lpp) {
-        Class<?> realCall = null;
-        String realCallName = null;
+    private void hookApplication(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application", lpp.classLoader, "onCreate",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        XposedBridge.log(TAG + " Application.onCreate 触发，模块已激活");
+                    }
+                });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook Application 失败: " + t.getMessage());
+        }
+    }
 
+    private void hookNewCall(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> clientClass = XposedHelpers.findClass("okhttp3.OkHttpClient", lpp.classLoader);
+            Class<?> requestClass = XposedHelpers.findClass("okhttp3.Request", lpp.classLoader);
+
+            XposedHelpers.findAndHookMethod(clientClass, "newCall", requestClass, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object request = param.args[0];
+                        String u = getUrlFromRequest(request);
+                        if (u == null) return;
+
+                        if (u.contains("ht_im/sock")) return;
+
+                        if (u.contains("p2p-chat/to-user-chat")) {
+                            long now = System.currentTimeMillis();
+                            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) {
+                                param.setThrowable(new IOException(TAG + " blocked to-user-chat"));
+                                return;
+                            }
+                            lastToUserChatTs = now;
+                            return;
+                        }
+
+                        if (u.contains("profile/v2/userinfo")) {
+                            long now = System.currentTimeMillis();
+                            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) {
+                                param.setThrowable(new IOException(TAG + " blocked userinfo"));
+                                return;
+                            }
+                            lastUserinfoTs = now;
+                            return;
+                        }
+
+                        for (String p : BLOCK_PATHS) {
+                            if (u.contains(p)) {
+                                param.setThrowable(new IOException(TAG + " blocked " + p));
+                                return;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " newCall hook 异常: " + t.getMessage());
+                    }
+                }
+            });
+            XposedBridge.log(TAG + " hook OkHttpClient.newCall 成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook newCall 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookRealCall(XC_LoadPackage.LoadPackageParam lpp) {
+        Class<?> realCall = null;
         String[] candidates = {
             "okhttp3.internal.connection.RealCall",
             "okhttp3.RealCall",
         };
-
         for (String name : candidates) {
             try {
                 realCall = XposedHelpers.findClass(name, lpp.classLoader);
-                realCallName = name;
                 XposedBridge.log(TAG + " 找到 RealCall: " + name);
                 break;
             } catch (Throwable ignored) {}
         }
-
         if (realCall == null) {
-            XposedBridge.log(TAG + " 未找到任何 OkHttp RealCall，尝试 hook OkHttpClient.newCall");
-            hookNewCall(lpp);
+            XposedBridge.log(TAG + " 未找到 RealCall，跳过");
             return;
         }
-
-        final Class<?> rc = realCall;
 
         XC_MethodHook hook = new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    String u = extractUrl(param.thisObject);
+                    String u = getUrlFromRealCall(param.thisObject);
                     if (u == null) return;
 
                     if (u.contains("ht_im/sock")) return;
@@ -180,185 +246,104 @@ public class HookEntry implements IXposedHookLoadPackage {
                         }
                     }
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + " hook 内部异常: " + t.getMessage());
+                    XposedBridge.log(TAG + " RealCall hook 异常: " + t.getMessage());
                 }
             }
         };
 
-        boolean hookedAny = false;
-
         try {
-            XposedHelpers.findAndHookMethod(rc, "execute", hook);
-            hookedAny = true;
-            XposedBridge.log(TAG + " hook execute 成功");
+            XposedHelpers.findAndHookMethod(realCall, "execute", hook);
+            XposedBridge.log(TAG + " hook RealCall.execute 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook execute 失败: " + t.getMessage());
         }
 
         try {
-            Class<?> callbackClass = XposedHelpers.findClass("okhttp3.Callback", lpp.classLoader);
-            XposedHelpers.findAndHookMethod(rc, "enqueue", callbackClass, hook);
-            hookedAny = true;
-            XposedBridge.log(TAG + " hook enqueue 成功");
+            Class<?> cb = XposedHelpers.findClass("okhttp3.Callback", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(realCall, "enqueue", cb, hook);
+            XposedBridge.log(TAG + " hook RealCall.enqueue 成功");
         } catch (Throwable t) {
             try {
-                XposedBridge.hookAllMethods(rc, "enqueue", hook);
-                hookedAny = true;
+                XposedBridge.hookAllMethods(realCall, "enqueue", hook);
                 XposedBridge.log(TAG + " hook enqueue (hookAll) 成功");
             } catch (Throwable t2) {
                 XposedBridge.log(TAG + " hook enqueue 失败: " + t2.getMessage());
             }
         }
-
-        if (!hookedAny) {
-            XposedBridge.log(TAG + " RealCall hook 全部失败，尝试 newCall 方案");
-            hookNewCall(lpp);
-        }
     }
 
-    private void hookNewCall(XC_LoadPackage.LoadPackageParam lpp) {
-        try {
-            Class<?> clientClass = XposedHelpers.findClass("okhttp3.OkHttpClient", lpp.classLoader);
-            Class<?> requestClass = XposedHelpers.findClass("okhttp3.Request", lpp.classLoader);
-
-            XposedHelpers.findAndHookMethod(clientClass, "newCall", requestClass, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object request = param.args[0];
-                        String u = extractUrlFromRequest(request);
-                        if (u == null) return;
-
-                        if (u.contains("ht_im/sock")) return;
-
-                        if (u.contains("p2p-chat/to-user-chat")) {
-                            long now = System.currentTimeMillis();
-                            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) {
-                                param.setThrowable(new IOException(TAG + " blocked"));
-                                return;
-                            }
-                            lastToUserChatTs = now;
-                            return;
-                        }
-
-                        if (u.contains("profile/v2/userinfo")) {
-                            long now = System.currentTimeMillis();
-                            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) {
-                                param.setThrowable(new IOException(TAG + " blocked"));
-                                return;
-                            }
-                            lastUserinfoTs = now;
-                            return;
-                        }
-
-                        for (String p : BLOCK_PATHS) {
-                            if (u.contains(p)) {
-                                param.setThrowable(new IOException(TAG + " blocked"));
-                                return;
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            });
-            XposedBridge.log(TAG + " hook newCall 成功");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook newCall 失败: " + t.getMessage());
-        }
-    }
-
-    private static String extractUrl(Object realCallObj) {
-        // OkHttp 4.x Kotlin: request() 方法
-        try {
-            Object request = XposedHelpers.callMethod(realCallObj, "request");
-            return extractUrlFromRequest(request);
-        } catch (Throwable ignored) {}
-
-        // OkHttp 4.x Kotlin: getRequest() 方法
-        try {
-            Object request = XposedHelpers.callMethod(realCallObj, "getRequest");
-            return extractUrlFromRequest(request);
-        } catch (Throwable ignored) {}
-
-        // 直接访问字段 originalRequest
-        try {
-            Object request = XposedHelpers.getObjectField(realCallObj, "originalRequest");
-            return extractUrlFromRequest(request);
-        } catch (Throwable ignored) {}
-
-        try {
-            Object request = XposedHelpers.getObjectField(realCallObj, "request");
-            return extractUrlFromRequest(request);
-        } catch (Throwable ignored) {}
-
-        return null;
-    }
-
-    private static String extractUrlFromRequest(Object request) {
+    private static String getUrlFromRequest(Object request) {
         if (request == null) return null;
-
+        // OkHttp 4.x Kotlin: url() 方法
         try {
             Object url = XposedHelpers.callMethod(request, "url");
             if (url != null) return url.toString();
         } catch (Throwable ignored) {}
-
+        // getUrl()
         try {
             Object url = XposedHelpers.callMethod(request, "getUrl");
             if (url != null) return url.toString();
         } catch (Throwable ignored) {}
-
+        // 直接读字段
         try {
             Object url = XposedHelpers.getObjectField(request, "url");
             if (url != null) return url.toString();
         } catch (Throwable ignored) {}
+        return null;
+    }
 
+    private static String getUrlFromRealCall(Object call) {
+        if (call == null) return null;
+        // request() 方法
+        try {
+            Object req = XposedHelpers.callMethod(call, "request");
+            String u = getUrlFromRequest(req);
+            if (u != null) return u;
+        } catch (Throwable ignored) {}
+        // getRequest()
+        try {
+            Object req = XposedHelpers.callMethod(call, "getRequest");
+            String u = getUrlFromRequest(req);
+            if (u != null) return u;
+        } catch (Throwable ignored) {}
+        // originalRequest 字段
+        try {
+            Object req = XposedHelpers.getObjectField(call, "originalRequest");
+            String u = getUrlFromRequest(req);
+            if (u != null) return u;
+        } catch (Throwable ignored) {}
         return null;
     }
 
     private void hookChatPage(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            Class<?> fragmentClass = XposedHelpers.findClass(
+            Class<?> frag = XposedHelpers.findClass(
                 "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
-
-            hookVoidMethod(fragmentClass, "T3");
-            hookVoidMethod(fragmentClass, "R3");
-
-            try {
-                XposedHelpers.findAndHookMethod(fragmentClass, "S3", boolean.class, NOOP_HOOK);
-            } catch (Throwable ignored) {}
-
-            try {
-                XposedHelpers.findAndHookMethod(fragmentClass, "F3", boolean.class, NOOP_HOOK);
-            } catch (Throwable ignored) {}
-
+            hookVoidMethod(frag, "T3");
+            hookVoidMethod(frag, "R3");
+            try { XposedHelpers.findAndHookMethod(frag, "S3", boolean.class, NOOP_HOOK); } catch (Throwable ignored) {}
+            try { XposedHelpers.findAndHookMethod(frag, "F3", boolean.class, NOOP_HOOK); } catch (Throwable ignored) {}
+            XposedBridge.log(TAG + " hook ChatDetailFragment 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
         }
 
         try {
-            Class<?> vmClass = XposedHelpers.findClass("ha4", lpp.classLoader);
-
+            Class<?> vm = XposedHelpers.findClass("ha4", lpp.classLoader);
             try {
-                Class<?> tc2Class = XposedHelpers.findClass("tc2", lpp.classLoader);
-                XposedHelpers.findAndHookMethod(vmClass, "R", tc2Class, NOOP_HOOK);
+                Class<?> tc2 = XposedHelpers.findClass("tc2", lpp.classLoader);
+                XposedHelpers.findAndHookMethod(vm, "R", tc2, NOOP_HOOK);
             } catch (Throwable ignored) {}
-
-            try {
-                XposedHelpers.findAndHookMethod(vmClass, "P", int.class, int.class, NOOP_HOOK);
-            } catch (Throwable ignored) {}
-
-            try {
-                XposedHelpers.findAndHookMethod(vmClass, "A", java.util.List.class, NOOP_HOOK);
-            } catch (Throwable ignored) {}
-
+            try { XposedHelpers.findAndHookMethod(vm, "P", int.class, int.class, NOOP_HOOK); } catch (Throwable ignored) {}
+            try { XposedHelpers.findAndHookMethod(vm, "A", java.util.List.class, NOOP_HOOK); } catch (Throwable ignored) {}
+            XposedBridge.log(TAG + " hook ChatDetailViewModel 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook ChatDetailViewModel 失败: " + t.getMessage());
         }
     }
 
-    private void hookVoidMethod(Class<?> clazz, String methodName) {
-        try {
-            XposedHelpers.findAndHookMethod(clazz, methodName, NOOP_HOOK);
-        } catch (Throwable ignored) {}
+    private void hookVoidMethod(Class<?> clazz, String name) {
+        try { XposedHelpers.findAndHookMethod(clazz, name, NOOP_HOOK); } catch (Throwable ignored) {}
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
