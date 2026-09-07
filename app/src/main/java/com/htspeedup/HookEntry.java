@@ -211,10 +211,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    // execute 是同步请求，拦截会抛异常导致 app 弹网络错误，直接放行
-                    if ("execute".equals(param.method.getName())) {
-                        return;
-                    }
                     String u = getUrlFromRealCall(param.thisObject);
                     if (u == null) {
                         logRealCallDiagnosticsOnce(param.thisObject);
@@ -395,8 +391,14 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        // 只处理 enqueue（execute 已在 hook 里提前放行）
-        // 静默丢弃：不回调 onFailure，app 收不到失败通知，不会弹网络错误提示
-        param.setResult(null);
+        IOException ex = new IOException(TAG + " blocked");
+        if ("execute".equals(param.method.getName())) {
+            param.setThrowable(ex);
+        } else {
+            try {
+                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
+            } catch (Throwable ignored) {}
+            param.setResult(null);
+        }
     }
 }
