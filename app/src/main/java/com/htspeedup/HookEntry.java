@@ -41,10 +41,12 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile long lastToUserChatTs = 0;
     private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
 
+    // 记住当前聊天的 userId
     private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
 
+    // userinfo 查询去重：userId -> 上次查询时间
     private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
-    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
+    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;  // 20秒内不重复查同一用户
 
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
@@ -60,8 +62,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
-        hookUserInfoProviderLoad(lpp);
-        hookNetworkTimeoutToastSuppression(lpp);   // ← 新增：精确屏蔽网络超时黑框
+        hookUserInfoProviderLoad(lpp);      // ← 这是秒进的关键
+        hookNetworkTimeoutToastSuppression(lpp);  // ← 新增：屏蔽“网络超时”黑框
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -86,10 +88,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     /**
-     * 精确屏蔽黑框“网络超时，请重试 / 網絡超時，請重試 / ネットワークが途絶えました…”。
-     * 这三条文案是同一个资源 ID：0x7f141387 (network_timed_out_retry)。
-     * 统一显示出口：gm6.o(int resId, Context) → SimpleToast。
-     * 只拦截这个 resId，其它提示不动。
+     * 屏蔽“网络超时，请重试 / 網絡超時，請重試 / ネットワークが途絶えました…”黑框。
+     * 这三条文案是同一个资源 ID：0x7f141387（network_timed_out_retry）。
+     * HelloTalk 统一通过 gm6.o(int resId, Context) 显示这个黑框（内部走 SimpleToast）。
+     * 只拦截 resId == 0x7f141387，不影响其它任何提示。
      */
     private void hookNetworkTimeoutToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
         try {
@@ -102,7 +104,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object resIdObj = param.args[0];
                         if (!(resIdObj instanceof Integer)) return;
                         int resId = (Integer) resIdObj;
-                        // 只屏蔽“网络超时”黑框
                         if (resId == 0x7f141387) {
                             param.setResult(null);
                             XposedBridge.log(TAG + " 已屏蔽网络超时黑框 (0x7f141387)");
@@ -118,21 +119,26 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    // ★ 秒进的核心：hook Lyrv.b()，判断本地缓存充分就直接返回，不走协程查询
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> yrvClass = XposedHelpers.findClass("yrv", lpp.classLoader);
 
+            // hook b(int userId, List fields, int mode, orv callback, r06 continuation)
             XposedBridge.hookAllMethods(yrvClass, "b", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
+                        // 参数: args[0]=userId, args[1]=fields, args[2]=mode, args[3]=callback, args[4]=continuation
                         if (param.args == null || param.args.length < 5) return;
 
                         Object userIdObj = param.args[0];
                         if (!(userIdObj instanceof Integer)) return;
                         int userId = (Integer) userIdObj;
 
+                        // 检查本地缓存是否充分
                         if (hasEnoughCache(yrvClass, userId)) {
+                            // 本地缓存充分，直接返回缓存对象，不启动协程
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -141,9 +147,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
                         }
 
+                        // 缓存不足，让原方法走协程查询，但限制去重
                         long now = System.currentTimeMillis();
                         Long lastQuery = userinfoQueryRecord.get(userId);
                         if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
+                            // 20秒内已查过，跳过网络查询，用缓存返回
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -165,26 +173,33 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    // 检查本地缓存是否充分（有 UserBaseInfo 和 UserOnline）
     private static boolean hasEnoughCache(Class<?> yrvClass, int userId) {
         try {
+            // 获取 Lyrv 单例
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
             if (provider == null) return false;
 
+            // 读 Lyrv.d (内存缓存 w1i)
             Object cache = XposedHelpers.getObjectField(provider, "d");
             if (cache == null) return false;
 
+            // 查缓存里有没有这个 userId 的数据
             Object cachedData = XposedHelpers.callMethod(cache, "c", (Integer) userId);
             if (cachedData == null) return false;
 
-            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");
-            Object userOnline = XposedHelpers.callMethod(cachedData, "u");
+            // 检查 UserInfoModel 里是否有必要字段
+            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");  // UserBaseInfo
+            Object userOnline = XposedHelpers.callMethod(cachedData, "u");  // UserOnline
 
+            // 都有就认为缓存充分
             return baseInfo != null && userOnline != null;
         } catch (Throwable t) {
             return false;
         }
     }
 
+    // 从本地缓存取 UserInfoModel
     private static Object getCachedUserInfo(Class<?> yrvClass, int userId) {
         try {
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
