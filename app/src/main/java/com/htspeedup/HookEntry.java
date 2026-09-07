@@ -98,12 +98,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         "settle_center",
     };
 
-    private static volatile long lastUserinfoTs = 0;
-    private static final long USERINFO_DEDUP_MS = 10_000;
-
-    private static volatile long lastToUserChatTs = 0;
-    private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
-
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
@@ -118,6 +112,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
+        hookUserInfoProvider(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -137,6 +132,38 @@ public class HookEntry implements IXposedHookLoadPackage {
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook Application 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookUserInfoProvider(XC_LoadPackage.LoadPackageParam lpp) {
+        // UserInfoProvider（混淆名 yrv）是 userinfo 数据的唯一入口，有 loadRam/loadCache/loadNet 三级。
+        // 新版把「在线状态」合并进了 userinfo，但真相是：在线状态由 IM 推送实时写库
+        // （IMUserServiceImpl.j1 -> UserInfoDao.updateUserOnlineInfo），标题栏读本地 DB 即可。
+        // 修复：hook load 入口（b 方法），把加载模式（mode）强制改为 1=走缓存，
+        // 这样标题栏 queryUserInfo 走本地缓存（秒显不卡），在线状态靠 IM 推送保持实时（不失真）。
+        try {
+            Class<?> providerClass = XposedHelpers.findClass("yrv", lpp.classLoader);
+            XposedBridge.hookAllMethods(providerClass, "b", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        // b(ILjava/util/List;ILorv;Lp06;) —— args[0]=userId, args[2]=mode(0=网络,1=缓存)
+                        if (param.args == null || param.args.length < 3) return;
+                        Object modeObj = param.args[2];
+                        if (!(modeObj instanceof Integer)) return;
+                        int mode = (Integer) modeObj;
+                        if (mode == 0) {
+                            param.args[2] = 1; // 强制走缓存
+                            XposedBridge.log(TAG + " userinfo 走缓存 mode: 0->1");
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " userinfo provider hook 异常: " + t.getMessage());
+                    }
+                }
+            });
+            XposedBridge.log(TAG + " hook UserInfoProvider.load 成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
         }
     }
 
@@ -165,23 +192,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。集中处理白名单/去重/黑名单。 */
+    /** 返回 true 表示应拦截。集中处理白名单/黑名单。 */
     private static boolean shouldBlockUrl(String u) {
+        // 以下都是聊天页/个人页展示必需或走缓存方案的请求，放行
         if (u.contains("ht_im/sock")) return false;
-
-        if (u.contains("p2p-chat/to-user-chat")) {
-            long now = System.currentTimeMillis();
-            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
-            lastToUserChatTs = now;
-            return false;
-        }
-
-        if (u.contains("profile/v2/userinfo")) {
-            long now = System.currentTimeMillis();
-            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) return true;
-            lastUserinfoTs = now;
-            return false;
-        }
+        if (u.contains("p2p-chat/to-user-chat")) return false;
+        if (u.contains("profile/v2/userinfo")) return false;
 
         for (String p : BLOCK_PATHS) {
             if (u.contains(p)) return true;
@@ -211,6 +227,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
+                    // execute 是同步请求，拦截会抛异常导致 app 弹网络错误，直接放行
+                    if ("execute".equals(param.method.getName())) {
+                        return;
+                    }
                     String u = getUrlFromRealCall(param.thisObject);
                     if (u == null) {
                         logRealCallDiagnosticsOnce(param.thisObject);
@@ -391,14 +411,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        IOException ex = new IOException(TAG + " blocked");
-        if ("execute".equals(param.method.getName())) {
-            param.setThrowable(ex);
-        } else {
-            try {
-                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
-            } catch (Throwable ignored) {}
-            param.setResult(null);
-        }
+        // 只处理 enqueue（execute 已在 hook 里提前放行）
+        // 静默丢弃：不回调 onFailure，app 收不到失败通知，不会弹网络错误提示
+        param.setResult(null);
     }
 }
