@@ -248,7 +248,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static String getUrlFromRequest(Object request) {
         if (request == null) return null;
-        // OkHttp 4.x Kotlin: url() 方法
+        // OkHttp 4.x Kotlin: url() 方法返回 HttpUrl
         try {
             Object url = XposedHelpers.callMethod(request, "url");
             if (url != null) return url.toString();
@@ -263,20 +263,37 @@ public class HookEntry implements IXposedHookLoadPackage {
             Object url = XposedHelpers.getObjectField(request, "url");
             if (url != null) return url.toString();
         } catch (Throwable ignored) {}
+        // 遍历字段找 HttpUrl 类型
+        try {
+            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType().getName().contains("HttpUrl")) {
+                        f.setAccessible(true);
+                        Object url = f.get(request);
+                        if (url != null) return url.toString();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         return null;
     }
 
     private static String getUrlFromRealCall(Object call) {
         if (call == null) return null;
+        // OkHttp 4.x 内部方法，直接返回 URL 字符串，最可靠
+        try {
+            Object u = XposedHelpers.callMethod(call, "redactedUrl$okhttp");
+            if (u != null) return u.toString();
+        } catch (Throwable ignored) {}
         // request() 方法
         try {
             Object req = XposedHelpers.callMethod(call, "request");
             String u = getUrlFromRequest(req);
             if (u != null) return u;
         } catch (Throwable ignored) {}
-        // getRequest()
+        // getOriginalRequest()
         try {
-            Object req = XposedHelpers.callMethod(call, "getRequest");
+            Object req = XposedHelpers.callMethod(call, "getOriginalRequest");
             String u = getUrlFromRequest(req);
             if (u != null) return u;
         } catch (Throwable ignored) {}
@@ -285,20 +302,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             Object req = XposedHelpers.getObjectField(call, "originalRequest");
             String u = getUrlFromRequest(req);
             if (u != null) return u;
-        } catch (Throwable ignored) {}
-        // 遍历所有字段，找类型为 okhttp3.Request 的对象
-        try {
-            Class<?> reqClass = XposedHelpers.findClass("okhttp3.Request", call.getClass().getClassLoader());
-            for (Class<?> c = call.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (reqClass.isAssignableFrom(f.getType())) {
-                        f.setAccessible(true);
-                        Object req = f.get(call);
-                        String u = getUrlFromRequest(req);
-                        if (u != null) return u;
-                    }
-                }
-            }
         } catch (Throwable ignored) {}
         return null;
     }
