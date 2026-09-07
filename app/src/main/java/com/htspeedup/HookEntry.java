@@ -14,106 +14,39 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final String TAG = "HT_Speedup";
 
     private static final String[] BLOCK_PATHS = {
-        "shortflix_api",
-        "livehub/channel_list",
-        "get_thirtysix_question",
-        "language_partner/interested",
-        "gift_shop",
-        "resource_pre_load",
-        "free_recommend_status",
-        "is_refresh_netease_token",
-        "quality_copywriting_group",
-        "movie/risk/list",
-        "notification-settings",
-        "ali_log_token",
-        "report_logic",
-        "online_status",
-        "focus_info",
-        "chat_plan",
-        "emoji_rain",
-        "vip_gift",
-        "send_gift",
-        "closed_friend",
-        "bubble_tips",
-        "voice_input",
-        "translate_config",
-        "get_pay_chat_info",
-        "livehub/user/status",
-        "get_latest_chat_plans",
-        "chat_list_banner",
-        "vip_trial/banner",
-        "login_config/business/vip_product",
-        "chat_magic_wand",
-        "click_word_magic_wand",
-        "publishing_skills",
-        "vip_page_banner",
-        "vip_page_content",
-        "vip_info",
-        "vip_page",
-        "vip_banner",
-        "vip_privilege_config",
-        "vip_status_report",
-        "content_paywall",
-        "nobility_birthday",
-        "product_list",
-        "virtual_pay",
-        "learn_tab",
-        "system_notice",
-        "mnt_info",
-        "recommender_follow",
-        "moment_tab_info",
-        "list_op_uid",
-        "query_expose_record",
-        "post_recommend_btn",
-        "like_popup",
-        "newbie_task",
-        "get_user_sealing",
-        "ip_info",
-        "guest_config",
-        "launch_config",
-        "platform/banner",
-        "top_menu",
-        "htserver/report",
-        "sdkcs/verify",
-        "wns_config",
-        "livehub/live_voice",
-        "live_voice/cfg",
-        "multi_lang",
-        "ht_advert",
-        "rewarded_advert",
-        "login_config/business/advert",
-        "v_cube.license",
-        "meme/user",
-        "meme/batch_detail",
-        "moment/notify",
-        "exchange_list",
-        "chat_assist",
-        "translate/v2/config",
-        "translate/v2/sts",
-        "cards",
-        "magic_wand/main",
-        "get_course_module",
-        "profile_banner",
-        "learn_record",
-        "user_virtual_info",
-        "settle_center",
+        "shortflix_api", "livehub/channel_list", "get_thirtysix_question",
+        "language_partner/interested", "gift_shop", "resource_pre_load",
+        "free_recommend_status", "is_refresh_netease_token", "quality_copywriting_group",
+        "movie/risk/list", "notification-settings", "ali_log_token", "report_logic",
+        "online_status", "focus_info", "chat_plan", "emoji_rain", "vip_gift",
+        "send_gift", "closed_friend", "bubble_tips", "voice_input", "translate_config",
+        "get_pay_chat_info", "livehub/user/status", "get_latest_chat_plans",
+        "chat_list_banner", "vip_trial/banner", "login_config/business/vip_product",
+        "chat_magic_wand", "click_word_magic_wand", "publishing_skills",
+        "vip_page_banner", "vip_page_content", "vip_info", "vip_page", "vip_banner",
+        "vip_privilege_config", "vip_status_report", "content_paywall",
+        "nobility_birthday", "product_list", "virtual_pay", "learn_tab",
+        "system_notice", "mnt_info", "recommender_follow", "moment_tab_info",
+        "list_op_uid", "query_expose_record", "post_recommend_btn", "like_popup",
+        "newbie_task", "get_user_sealing", "ip_info", "guest_config", "launch_config",
+        "platform/banner", "top_menu", "htserver/report", "sdkcs/verify", "wns_config",
+        "livehub/live_voice", "live_voice/cfg", "multi_lang", "ht_advert",
+        "rewarded_advert", "login_config/business/advert", "v_cube.license",
+        "meme/user", "meme/batch_detail", "moment/notify", "exchange_list",
+        "chat_assist", "translate/v2/config", "translate/v2/sts", "cards",
+        "magic_wand/main", "get_course_module", "profile_banner", "learn_record",
+        "user_virtual_info", "settle_center",
     };
 
-    // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
-    private static final ConcurrentHashMap<String, Long> toUserChatDedup = new ConcurrentHashMap<>();
-    private static final long TO_USER_CHAT_DEDUP_MS = 15_000;
-
-    // 记住当前 ChatDetailFragment 的 userId
-    private static final java.lang.ThreadLocal<Integer> CHAT_USER_ID =
-        new java.lang.ThreadLocal<Integer>() {
-            @Override
-            protected Integer initialValue() {
-                return 0;
-            }
-        };
-
-    // 缓存用户信息查询时间（userId -> 最后查询时间）
-    private static final ConcurrentHashMap<Integer, Long> userinfoQueryCache = new ConcurrentHashMap<>();
+    private static volatile long lastToUserChatTs = 0;
+    private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
+    
+    // 记住当前聊天的 userId
+    private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
+    
+    // userinfo 查询去重：userId -> 上次查询时间
+    private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
+    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;  // 20秒内不重复查同一用户
 
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
@@ -129,7 +62,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
-        hookUserInfoProvider(lpp);
+        hookUserInfoProviderLoad(lpp);      // ← 这是秒进的关键
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -141,12 +74,11 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void hookApplication(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Application", lpp.classLoader, "onCreate",
+            XposedHelpers.findAndHookMethod("android.app.Application", lpp.classLoader, "onCreate",
                 new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        XposedBridge.log(TAG + " Application.onCreate 触发，模块已激活");
+                        XposedBridge.log(TAG + " Application.onCreate 激活");
                     }
                 });
         } catch (Throwable t) {
@@ -154,45 +86,105 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private void hookUserInfoProvider(XC_LoadPackage.LoadPackageParam lpp) {
-        // UserInfoProvider（混淆名 yrv）是 userinfo 数据的唯一入口，有 loadRam/loadCache/loadNet 三级。
-        // 核心分派方法 g(Lyrv,List,List,int mode,orv,vnc,r06,int) 是 static 方法，
-        // 所有 load 入口（b/c/d/e/f/h）最终都经过它，mode 在 args[3]：
-        //   mode=0 → loadNet（纯网络，慢）
-        //   mode=1 → loadCache（缓存优先，DB miss 时 boolean=true 走网络补充）
-        // 修复：hook g，把 mode 从 0 改成 1，让所有 userinfo 加载走缓存优先，
-        // 缓存命中秒显不发网络（秒进），缓存 miss 走网络补充（HTTP 层放行，不会空白）。
+    // ★ 秒进的核心：hook Lyrv.b()，判断本地缓存充分就直接返回，不走协程查询
+    private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            Class<?> providerClass = XposedHelpers.findClass("yrv", lpp.classLoader);
-            XposedBridge.hookAllMethods(providerClass, "g", new XC_MethodHook() {
+            Class<?> yrvClass = XposedHelpers.findClass("yrv", lpp.classLoader);
+            
+            // hook b(int userId, List fields, int mode, orv callback, r06 continuation)
+            XposedBridge.hookAllMethods(yrvClass, "b", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        // g(Lyrv;Ljava/util/List;Ljava/util/List;ILorv;Lvnc;Lr06;I) —— static 方法
-                        // args[0]=Lyrv, args[1]=List, args[2]=List, args[3]=mode
-                        if (param.args == null || param.args.length < 4) return;
-                        Object modeObj = param.args[3];
-                        if (!(modeObj instanceof Integer)) return;
-                        int mode = (Integer) modeObj;
-                        if (mode == 0) {
-                            param.args[3] = 1; // 强制走缓存优先
-                            XposedBridge.log(TAG + " userinfo 走缓存 mode: 0->1");
+                        // 参数: args[0]=userId, args[1]=fields, args[2]=mode, args[3]=callback, args[4]=continuation
+                        if (param.args == null || param.args.length < 5) return;
+                        
+                        Object userIdObj = param.args[0];
+                        if (!(userIdObj instanceof Integer)) return;
+                        int userId = (Integer) userIdObj;
+                        
+                        // 检查本地缓存是否充分
+                        if (hasEnoughCache(yrvClass, userId)) {
+                            // 本地缓存充分，直接返回缓存对象，不启动协程
+                            Object cachedData = getCachedUserInfo(yrvClass, userId);
+                            if (cachedData != null) {
+                                param.setResult(cachedData);
+                                XposedBridge.log(TAG + " userinfo 本地缓存秒回: userId=" + userId);
+                                return;
+                            }
                         }
+                        
+                        // 缓存不足，让原方法走协程查询，但限制去重
+                        long now = System.currentTimeMillis();
+                        Long lastQuery = userinfoQueryRecord.get(userId);
+                        if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
+                            // 20秒内已查过，跳过网络查询，用缓存返回
+                            Object cachedData = getCachedUserInfo(yrvClass, userId);
+                            if (cachedData != null) {
+                                param.setResult(cachedData);
+                                XposedBridge.log(TAG + " userinfo 去重: userId=" + userId);
+                                return;
+                            }
+                        }
+                        
+                        userinfoQueryRecord.put(userId, now);
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + " userinfo provider hook 异常: " + t.getMessage());
+                        XposedBridge.log(TAG + " userinfo provider hook error: " + t.getMessage());
                     }
                 }
             });
-            XposedBridge.log(TAG + " hook UserInfoProvider.load(g) 成功");
+            
+            XposedBridge.log(TAG + " hook UserInfoProvider.b() 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
+        }
+    }
+
+    // 检查本地缓存是否充分（有 UserBaseInfo 和 UserOnline）
+    private static boolean hasEnoughCache(Class<?> yrvClass, int userId) {
+        try {
+            // 获取 Lyrv 单例
+            Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
+            if (provider == null) return false;
+            
+            // 读 Lyrv.d (内存缓存 w1i)
+            Object cache = XposedHelpers.getObjectField(provider, "d");
+            if (cache == null) return false;
+            
+            // 查缓存里有没有这个 userId 的数据
+            Object cachedData = XposedHelpers.callMethod(cache, "c", (Integer) userId);
+            if (cachedData == null) return false;
+            
+            // 检查 UserInfoModel 里是否有必要字段
+            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");  // UserBaseInfo
+            Object userOnline = XposedHelpers.callMethod(cachedData, "u");  // UserOnline
+            
+            // 都有就认为缓存充分
+            return baseInfo != null && userOnline != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // 从本地缓存取 UserInfoModel
+    private static Object getCachedUserInfo(Class<?> yrvClass, int userId) {
+        try {
+            Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
+            if (provider == null) return null;
+            
+            Object cache = XposedHelpers.getObjectField(provider, "d");
+            if (cache == null) return null;
+            
+            return XposedHelpers.callMethod(cache, "c", (Integer) userId);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
     private void hookTitleController(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> pitClass = XposedHelpers.findClass("pit", lpp.classLoader);
-
+            
             XposedBridge.hookAllMethods(pitClass, "M", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -200,20 +192,20 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object titleController = param.thisObject;
                         Object userOnline = XposedHelpers.getObjectField(titleController, "i");
                         Object baseInfo = XposedHelpers.getObjectField(titleController, "k");
-
-                        // 缓存有效就跳过查询
+                        
                         if (userOnline != null && baseInfo != null) {
                             param.setResult(null);
-                            XposedBridge.log(TAG + " 标题栏本地缓存有效，跳过查询");
+                            XposedBridge.log(TAG + " 标题栏缓存充分，跳过查询");
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + " Lpit.M() hook error: " + t.getMessage());
+                        XposedBridge.log(TAG + " Lpit.M() error: " + t.getMessage());
                     }
                 }
             });
+            
             XposedBridge.log(TAG + " hook Lpit.M() 成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook title controller failed: " + t.getMessage());
+            XposedBridge.log(TAG + " hook title failed: " + t.getMessage());
         }
     }
 
@@ -221,8 +213,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Class<?> fragClass = XposedHelpers.findClass(
                 "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
-
-            // 记住进入聊天页时的对方 userId
+            
             XposedBridge.hookAllMethods(fragClass, "setArguments", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -236,34 +227,21 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + " setArguments error: " + t.getMessage());
+                        // ignored
                     }
                 }
             });
-
-            XposedBridge.log(TAG + " hook ChatDetailFragment.setArguments 成功");
+            
+            XposedBridge.log(TAG + " hook ChatDetailFragment 成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook ChatDetailFragment failed: " + t.getMessage());
+            XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
         }
-    }
-
-    private static int parseUserIdFromUrl(String u) {
-        try {
-            int idPos = u.indexOf("id=");
-            if (idPos >= 0) {
-                int endPos = u.indexOf("&", idPos);
-                if (endPos < 0) endPos = u.length();
-                String idStr = u.substring(idPos + 3, endPos);
-                return Integer.parseInt(idStr);
-            }
-        } catch (Throwable ignored) {}
-        return 0;
     }
 
     private void hookNewCall(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> clientClass = XposedHelpers.findClass("okhttp3.OkHttpClient", lpp.classLoader);
-            int n = XposedBridge.hookAllMethods(clientClass, "newCall", new XC_MethodHook() {
+            XposedBridge.hookAllMethods(clientClass, "newCall", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
@@ -271,52 +249,27 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object request = param.args[0];
                         String u = getUrlFromRequest(request);
                         if (u == null) return;
-                        if (shouldBlock(u, request)) {
-                            param.setThrowable(new IOException(TAG + " blocked via newCall"));
+                        if (shouldBlockUrl(u)) {
+                            param.setThrowable(new IOException(TAG + " blocked"));
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + " newCall hook 异常: " + t.getMessage());
+                        // ignored
                     }
                 }
-            }).size();
-            XposedBridge.log(TAG + " hook OkHttpClient.newCall(hookAll) 命中方法数=" + n);
+            });
+            XposedBridge.log(TAG + " hook newCall 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook newCall 失败: " + t.getMessage());
         }
     }
 
-    /** 返回 true 表示应拦截。u=URL，request=Request对象。 */
-    private static boolean shouldBlock(String u, Object request) {
-        // IM 长连接，放行
+    private static boolean shouldBlockUrl(String u) {
         if (u.contains("ht_im/sock")) return false;
 
-        // userinfo 智能去重
-        if (u.contains("profile/v2/userinfo")) {
-            int chatUserId = CHAT_USER_ID.get();
-            int targetUserId = parseUserIdFromUrl(u);
-
-            if (chatUserId > 0 && targetUserId == chatUserId) {
-                long now = System.currentTimeMillis();
-                Long lastQuery = userinfoQueryCache.get(targetUserId);
-
-                if (lastQuery != null && now - lastQuery < 15_000) {
-                    XposedBridge.log(TAG + " userinfo 拦截重复查询: user_id=" + targetUserId);
-                    return true;
-                }
-
-                userinfoQueryCache.put(targetUserId, now);
-                return false;
-            }
-
-            return false;
-        }
-
-        // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
         if (u.contains("p2p-chat/to-user-chat")) {
             long now = System.currentTimeMillis();
-            Long last = toUserChatDedup.get(u);
-            if (last != null && now - last < TO_USER_CHAT_DEDUP_MS) return true;
-            toUserChatDedup.put(u, now);
+            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
+            lastToUserChatTs = now;
             return false;
         }
 
@@ -328,171 +281,35 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void hookRealCall(XC_LoadPackage.LoadPackageParam lpp) {
         Class<?> realCall = null;
-        String[] candidates = {
-            "okhttp3.internal.connection.RealCall",
-            "okhttp3.RealCall",
-        };
+        String[] candidates = {"okhttp3.internal.connection.RealCall", "okhttp3.RealCall"};
         for (String name : candidates) {
             try {
                 realCall = XposedHelpers.findClass(name, lpp.classLoader);
-                XposedBridge.log(TAG + " 找到 RealCall: " + name);
                 break;
             } catch (Throwable ignored) {}
         }
-        if (realCall == null) {
-            XposedBridge.log(TAG + " 未找到 RealCall，跳过");
-            return;
-        }
+        if (realCall == null) return;
 
         XC_MethodHook hook = new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    // execute 是同步请求，拦截会抛异常导致 app 弹网络错误，直接放行
-                    if ("execute".equals(param.method.getName())) {
-                        return;
-                    }
-                    Object request = getRequestFromRealCall(param.thisObject);
-                    if (request == null) {
-                        logRealCallDiagnosticsOnce(param.thisObject);
-                        return;
-                    }
-                    String u = getUrlFromRequest(request);
+                    String u = getUrlFromRealCall(param.thisObject);
                     if (u == null) return;
-                    boolean block = shouldBlock(u, request);
-                    logUrlOnce(u, block, param.method.getName());
-                    if (block) {
+                    if (shouldBlockUrl(u)) {
                         blockRequest(param);
                     }
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + " RealCall hook 异常: " + t.getMessage());
+                    // ignored
                 }
             }
         };
 
         try {
-            XposedHelpers.findAndHookMethod(realCall, "execute", hook);
-            XposedBridge.log(TAG + " hook RealCall.execute 成功");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook execute 失败: " + t.getMessage());
-        }
-
-        try {
-            Class<?> cb = XposedHelpers.findClass("okhttp3.Callback", lpp.classLoader);
-            XposedHelpers.findAndHookMethod(realCall, "enqueue", cb, hook);
+            XposedBridge.hookAllMethods(realCall, "enqueue", hook);
             XposedBridge.log(TAG + " hook RealCall.enqueue 成功");
         } catch (Throwable t) {
-            try {
-                XposedBridge.hookAllMethods(realCall, "enqueue", hook);
-                XposedBridge.log(TAG + " hook enqueue (hookAll) 成功");
-            } catch (Throwable t2) {
-                XposedBridge.log(TAG + " hook enqueue 失败: " + t2.getMessage());
-            }
-        }
-    }
-
-    private static String getUrlFromRequest(Object request) {
-        if (request == null) return null;
-        // 最简单可靠：Request.toString() 打印 Request{method=GET, url=..., headers=[...]}
-        // toString 是 Object 方法，R8 不会混淆，url= 后面的就是完整 URL
-        try {
-            String s = request.toString();
-            if (s != null) {
-                int u = s.indexOf("url=");
-                if (u >= 0) {
-                    int end = s.indexOf(", ", u);
-                    if (end < 0) end = s.length();
-                    String url = s.substring(u + 4, end);
-                    if (url.startsWith("http")) return url;
-                }
-            }
-        } catch (Throwable ignored) {}
-        // OkHttp 4.x Kotlin: url() 方法（可能被混淆成 a()）
-        String[] urlMethods = {"url", "getUrl", "a"};
-        for (String m : urlMethods) {
-            try {
-                Object url = XposedHelpers.callMethod(request, m);
-                if (url != null) {
-                    String s = url.toString();
-                    if (s != null && s.startsWith("http")) return s;
-                }
-            } catch (Throwable ignored) {}
-        }
-        // 直接读字段（可能被混淆成 a）
-        String[] urlFields = {"url", "a"};
-        for (String f : urlFields) {
-            try {
-                Object url = XposedHelpers.getObjectField(request, f);
-                if (url != null) {
-                    String s = url.toString();
-                    if (s != null && s.startsWith("http")) return s;
-                }
-            } catch (Throwable ignored) {}
-        }
-        // 遍历字段找 HttpUrl 类型
-        try {
-            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (f.getType().getName().contains("HttpUrl")) {
-                        f.setAccessible(true);
-                        Object url = f.get(request);
-                        if (url != null) return url.toString();
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static Object getRequestFromRealCall(Object call) {
-        if (call == null) return null;
-        try {
-            Object req = XposedHelpers.callMethod(call, "request");
-            if (req != null) return req;
-        } catch (Throwable ignored) {}
-        try {
-            Object req = XposedHelpers.callMethod(call, "getOriginalRequest");
-            if (req != null) return req;
-        } catch (Throwable ignored) {}
-        try {
-            Object req = XposedHelpers.getObjectField(call, "originalRequest");
-            if (req != null) return req;
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static volatile boolean diagLogged = false;
-    private static volatile int urlLogCount = 0;
-    private static final int URL_LOG_LIMIT = 30;
-
-    private static void logUrlOnce(String url, boolean block, String method) {
-        if (urlLogCount >= URL_LOG_LIMIT) return;
-        urlLogCount++;
-        String shortUrl = url.length() > 80 ? url.substring(0, 80) + "..." : url;
-        XposedBridge.log(TAG + " [" + method + "] block=" + block + " url=" + shortUrl);
-    }
-
-    private static void logRealCallDiagnosticsOnce(Object call) {
-        if (diagLogged || call == null) return;
-        diagLogged = true;
-        try {
-            StringBuilder sb = new StringBuilder(TAG + " 诊断 RealCall 类=" + call.getClass().getName());
-            sb.append("\n  方法:");
-            for (java.lang.reflect.Method m : call.getClass().getMethods()) {
-                String n = m.getName();
-                if (n.contains("equest") || n.equals("url") || n.contains("Url")) {
-                    sb.append(' ').append(n).append('(').append(m.getParameterTypes().length).append(")=").append(m.getReturnType().getSimpleName());
-                }
-            }
-            sb.append("\n  字段:");
-            for (Class<?> c = call.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    sb.append(' ').append(f.getName()).append(':').append(f.getType().getSimpleName());
-                }
-            }
-            XposedBridge.log(sb.toString());
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " 诊断失败: " + t.getMessage());
+            XposedBridge.log(TAG + " hook enqueue 失败: " + t.getMessage());
         }
     }
 
@@ -506,7 +323,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             try { XposedHelpers.findAndHookMethod(frag, "F3", boolean.class, NOOP_HOOK); } catch (Throwable ignored) {}
             XposedBridge.log(TAG + " hook ChatDetailFragment 成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
+            // ignored
         }
 
         try {
@@ -519,7 +336,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             try { XposedHelpers.findAndHookMethod(vm, "A", java.util.List.class, NOOP_HOOK); } catch (Throwable ignored) {}
             XposedBridge.log(TAG + " hook ChatDetailViewModel 成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook ChatDetailViewModel 失败: " + t.getMessage());
+            // ignored
         }
     }
 
@@ -528,8 +345,42 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        // 只处理 enqueue（execute 已在 hook 里提前放行）
-        // 静默丢弃：不回调 onFailure，app 收不到失败通知，不会弹网络错误提示
+        try {
+            if (param.args != null && param.args.length > 0) {
+                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, 
+                    new IOException(TAG + " blocked"));
+            }
+        } catch (Throwable ignored) {}
         param.setResult(null);
+    }
+
+    private static String getUrlFromRequest(Object request) {
+        if (request == null) return null;
+        try {
+            String s = request.toString();
+            if (s != null) {
+                int u = s.indexOf("url=");
+                if (u >= 0) {
+                    int end = s.indexOf(", ", u);
+                    if (end < 0) end = s.length();
+                    String url = s.substring(u + 4, end);
+                    if (url.startsWith("http")) return url;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String getUrlFromRealCall(Object call) {
+        if (call == null) return null;
+        try {
+            Object req = XposedHelpers.callMethod(call, "request");
+            return getUrlFromRequest(req);
+        } catch (Throwable ignored) {}
+        try {
+            Object req = XposedHelpers.getObjectField(call, "originalRequest");
+            return getUrlFromRequest(req);
+        } catch (Throwable ignored) {}
+        return null;
     }
 }
