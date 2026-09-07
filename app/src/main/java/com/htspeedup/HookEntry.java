@@ -1,6 +1,7 @@
 package com.htspeedup;
 
 import java.io.IOException;
+import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
