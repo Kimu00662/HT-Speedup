@@ -41,8 +41,13 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile long lastToUserChatTs = 0;
     private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
     
+    // 记住当前在聊天页面（用来判断是否启用缓存去重）
+    private static final ThreadLocal<Boolean> IN_CHAT_PAGE = new ThreadLocal<>();
+    
+    // 记住当前聊天的 userId
     private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
     
+    // userinfo 查询去重：只在聊天页启用
     private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
     private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
 
@@ -63,6 +68,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookUserInfoProviderLoad(lpp);
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
+        hookProfileActivity(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -98,27 +104,33 @@ public class HookEntry implements IXposedHookLoadPackage {
                         if (!(userIdObj instanceof Integer)) return;
                         int userId = (Integer) userIdObj;
                         
-                        if (hasEnoughCache(yrvClass, userId)) {
-                            Object cachedData = getCachedUserInfo(yrvClass, userId);
-                            if (cachedData != null) {
-                                param.setResult(cachedData);
-                                XposedBridge.log(TAG + " userinfo 本地缓存秒回: userId=" + userId);
-                                return;
+                        // 只在聊天页启用缓存去重
+                        Boolean inChatPage = IN_CHAT_PAGE.get();
+                        if (inChatPage != null && inChatPage) {
+                            // 在聊天页，启用缓存优先
+                            if (hasEnoughCache(yrvClass, userId)) {
+                                Object cachedData = getCachedUserInfo(yrvClass, userId);
+                                if (cachedData != null) {
+                                    param.setResult(cachedData);
+                                    XposedBridge.log(TAG + " userinfo 聊天页缓存秒回: userId=" + userId);
+                                    return;
+                                }
                             }
-                        }
-                        
-                        long now = System.currentTimeMillis();
-                        Long lastQuery = userinfoQueryRecord.get(userId);
-                        if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
-                            Object cachedData = getCachedUserInfo(yrvClass, userId);
-                            if (cachedData != null) {
-                                param.setResult(cachedData);
-                                XposedBridge.log(TAG + " userinfo 去重: userId=" + userId);
-                                return;
+                            
+                            long now = System.currentTimeMillis();
+                            Long lastQuery = userinfoQueryRecord.get(userId);
+                            if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
+                                Object cachedData = getCachedUserInfo(yrvClass, userId);
+                                if (cachedData != null) {
+                                    param.setResult(cachedData);
+                                    XposedBridge.log(TAG + " userinfo 聊天页去重: userId=" + userId);
+                                    return;
+                                }
                             }
+                            
+                            userinfoQueryRecord.put(userId, now);
                         }
-                        
-                        userinfoQueryRecord.put(userId, now);
+                        // 不在聊天页（比如个人资料页），放行网络查询
                     } catch (Throwable t) {
                         XposedBridge.log(TAG + " userinfo provider hook error: " + t.getMessage());
                     }
@@ -198,6 +210,32 @@ public class HookEntry implements IXposedHookLoadPackage {
             Class<?> fragClass = XposedHelpers.findClass(
                 "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
             
+            // 进入聊天页时设置标志
+            XposedBridge.hookAllMethods(fragClass, "onViewCreated", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        IN_CHAT_PAGE.set(true);
+                        XposedBridge.log(TAG + " 进入聊天页，启用缓存去重");
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+            
+            // 离开聊天页时清除标志
+            XposedBridge.hookAllMethods(fragClass, "onDestroyView", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        IN_CHAT_PAGE.set(false);
+                        XposedBridge.log(TAG + " 离开聊天页，禁用缓存去重");
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+            
             XposedBridge.hookAllMethods(fragClass, "setArguments", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -219,6 +257,48 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " hook ChatDetailFragment 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookProfileActivity(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> profileClass = XposedHelpers.findClass(
+                "com.hellotalk.profile.v2.ui.activity.EditProfileActivityV2", lpp.classLoader);
+            
+            // 进入个人资料页时禁用缓存去重
+            XposedBridge.hookAllMethods(profileClass, "onCreate", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        IN_CHAT_PAGE.set(false);
+                        XposedBridge.log(TAG + " 进入个人资料页，禁用缓存去重");
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+            
+            XposedBridge.log(TAG + " hook ProfileActivity 成功");
+        } catch (Throwable t) {
+            // 可能是其他版本的 profile activity
+            try {
+                Class<?> profileClass = XposedHelpers.findClass(
+                    "com.hellotalk.profile.v3.ui.activity.EditProfileActivityV3", lpp.classLoader);
+                XposedBridge.hookAllMethods(profileClass, "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            IN_CHAT_PAGE.set(false);
+                            XposedBridge.log(TAG + " 进入个人资料页，禁用缓存去重");
+                        } catch (Throwable t) {
+                            // ignored
+                        }
+                    }
+                });
+                XposedBridge.log(TAG + " hook ProfileActivityV3 成功");
+            } catch (Throwable t2) {
+                XposedBridge.log(TAG + " hook ProfileActivity 失败: " + t2.getMessage());
+            }
         }
     }
 
@@ -329,8 +409,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        // 静默拦截：不调 onFailure，直接返回空 Call，app 认为请求成功但没数据
-        // 这样不会弹网络错误提示
         param.setResult(null);
     }
 
