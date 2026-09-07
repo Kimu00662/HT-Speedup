@@ -257,9 +257,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             return false;
         }
 
-        // profile/v2/userinfo 放行，让个人资料页正常加载
-        if (u.contains("profile/v2/userinfo")) return false;
-
         for (String p : BLOCK_PATHS) {
             if (u.contains(p)) return true;
         }
@@ -332,6 +329,15 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param.args != null && param.args.length > 0) {
+                // 调用 onResponse 而不是 onFailure，让 app 觉得请求成功了
+                // 这样就不会弹网络错误提示
+                try {
+                    XposedHelpers.callMethod(param.args[0], "onResponse", param.thisObject, null);
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
         param.setResult(null);
     }
 
