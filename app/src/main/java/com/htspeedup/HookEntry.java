@@ -99,10 +99,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         "settle_center",
     };
 
-    // userinfo 按 body 指纹去重（区分自己/对方），to-user-chat 按完整 URL 去重
-    private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
-    private static final long USERINFO_DEDUP_MS = 15_000;
-
+    // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
     private static final ConcurrentHashMap<String, Long> toUserChatDedup = new ConcurrentHashMap<>();
     private static final long TO_USER_CHAT_DEDUP_MS = 15_000;
 
@@ -145,23 +142,26 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void hookUserInfoProvider(XC_LoadPackage.LoadPackageParam lpp) {
         // UserInfoProvider（混淆名 yrv）是 userinfo 数据的唯一入口，有 loadRam/loadCache/loadNet 三级。
-        // 新版把「在线状态」合并进了 userinfo，但真相是：在线状态由 IM 推送实时写库
-        // （IMUserServiceImpl.j1 -> UserInfoDao.updateUserOnlineInfo），标题栏读本地 DB 即可。
-        // 修复：hook load 入口（b 方法），把加载模式（mode）强制改为 1=走缓存，
-        // 这样标题栏 queryUserInfo 走本地缓存（秒显不卡），在线状态靠 IM 推送保持实时（不失真）。
+        // 核心分派方法 g(Lyrv,List,List,int mode,orv,vnc,r06,int) 是 static 方法，
+        // 所有 load 入口（b/c/d/e/f/h）最终都经过它，mode 在 args[3]：
+        //   mode=0 → loadNet（纯网络，慢）
+        //   mode=1 → loadCache（缓存优先，DB miss 时 boolean=true 走网络补充）
+        // 修复：hook g，把 mode 从 0 改成 1，让所有 userinfo 加载走缓存优先，
+        // 缓存命中秒显不发网络（秒进），缓存 miss 走网络补充（HTTP 层放行，不会空白）。
         try {
             Class<?> providerClass = XposedHelpers.findClass("yrv", lpp.classLoader);
-            XposedBridge.hookAllMethods(providerClass, "b", new XC_MethodHook() {
+            XposedBridge.hookAllMethods(providerClass, "g", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        // b(ILjava/util/List;ILorv;Lp06;) —— args[0]=userId, args[2]=mode(0=网络,1=缓存)
-                        if (param.args == null || param.args.length < 3) return;
-                        Object modeObj = param.args[2];
+                        // g(Lyrv;Ljava/util/List;Ljava/util/List;ILorv;Lvnc;Lr06;I) —— static 方法
+                        // args[0]=Lyrv, args[1]=List, args[2]=List, args[3]=mode
+                        if (param.args == null || param.args.length < 4) return;
+                        Object modeObj = param.args[3];
                         if (!(modeObj instanceof Integer)) return;
                         int mode = (Integer) modeObj;
                         if (mode == 0) {
-                            param.args[2] = 1; // 强制走缓存
+                            param.args[3] = 1; // 强制走缓存优先
                             XposedBridge.log(TAG + " userinfo 走缓存 mode: 0->1");
                         }
                     } catch (Throwable t) {
@@ -169,7 +169,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                     }
                 }
             });
-            XposedBridge.log(TAG + " hook UserInfoProvider.load 成功");
+            XposedBridge.log(TAG + " hook UserInfoProvider.load(g) 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
         }
@@ -200,10 +200,14 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。u=URL，request=Request对象（用于 body 指纹）。 */
+    /** 返回 true 表示应拦截。u=URL，request=Request对象。 */
     private static boolean shouldBlock(String u, Object request) {
         // IM 长连接，放行
         if (u.contains("ht_im/sock")) return false;
+
+        // userinfo 完全放行：由 hook Lyrv.g 的 mode=1（缓存优先）控制加载策略，
+        // 缓存 miss 时的网络补充需要能正常走，所以这里不做任何去重拦截。
+        if (u.contains("profile/v2/userinfo")) return false;
 
         // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
         if (u.contains("p2p-chat/to-user-chat")) {
@@ -211,19 +215,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             Long last = toUserChatDedup.get(u);
             if (last != null && now - last < TO_USER_CHAT_DEDUP_MS) return true;
             toUserChatDedup.put(u, now);
-            return false;
-        }
-
-        // userinfo 按 body 指纹去重：自己/对方各自放行首次，后续重复才拦截。
-        // 在线状态由 IM 推送实时写库（标题栏走 mode=1 缓存读本地 DB），
-        // 所以 HTTP 层去重不会导致在线状态失真，反而带来秒进。
-        if (u.contains("profile/v2/userinfo")) {
-            String fp = getBodyFingerprint(request);
-            String key = (fp != null) ? fp : u;
-            long now = System.currentTimeMillis();
-            Long last = userinfoDedup.get(key);
-            if (last != null && now - last < USERINFO_DEDUP_MS) return true;
-            userinfoDedup.put(key, now);
             return false;
         }
 
@@ -351,10 +342,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static String getUrlFromRealCall(Object call) {
-        return getUrlFromRequest(getRequestFromRealCall(call));
-    }
-
     private static Object getRequestFromRealCall(Object call) {
         if (call == null) return null;
         try {
@@ -370,52 +357,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             if (req != null) return req;
         } catch (Throwable ignored) {}
         return null;
-    }
-
-    /** 从 Request 对象提取 body 字节指纹（前32字节hex+长度），用于 userinfo 按内容区分去重。 */
-    private static String getBodyFingerprint(Object request) {
-        if (request == null) return null;
-        try {
-            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    f.setAccessible(true);
-                    Object v;
-                    try { v = f.get(request); } catch (Throwable ignored) { continue; }
-                    if (v == null) continue;
-                    String hex = extractBytesFingerprint(v);
-                    if (hex != null) return hex;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static String extractBytesFingerprint(Object obj) {
-        if (obj == null) return null;
-        if (obj instanceof byte[]) {
-            return bytesToFingerprint((byte[]) obj);
-        }
-        try {
-            for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (f.getType() == byte[].class) {
-                        f.setAccessible(true);
-                        byte[] b = (byte[]) f.get(obj);
-                        if (b != null && b.length > 0) return bytesToFingerprint(b);
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static String bytesToFingerprint(byte[] b) {
-        int n = Math.min(32, b.length);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < n; i++) {
-            sb.append(String.format("%02x", b[i]));
-        }
-        return sb.append('#').append(b.length).toString();
     }
 
     private static volatile boolean diagLogged = false;
