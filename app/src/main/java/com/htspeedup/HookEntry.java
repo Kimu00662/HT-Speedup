@@ -180,5 +180,3 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 }
-
-</parameter>
