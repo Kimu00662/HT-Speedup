@@ -1,6 +1,7 @@
 package com.htspeedup;
 
 import java.io.IOException;
+import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -103,6 +104,10 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     };
 
+    // userinfo 按 body 指纹去重：body 指纹 -> 上次放行时间
+    private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
+    private static final long USERINFO_DEDUP_MS = 3000;
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
         if (!"com.hellotalk".equals(lpp.packageName)) return;
@@ -143,7 +148,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object request = param.args[0];
                         String u = getUrlFromRequest(request);
                         if (u == null) return;
-                        if (shouldBlockUrl(u)) {
+                        if (shouldBlock(u, request)) {
                             param.setThrowable(new IOException(TAG + " blocked via newCall"));
                         }
                     } catch (Throwable t) {
@@ -157,14 +162,26 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。集中处理白名单/去重/黑名单。 */
-    private static boolean shouldBlockUrl(String u) {
+    /** 返回 true 表示应拦截。u=URL，request=Request对象（用于 body 指纹）。 */
+    private static boolean shouldBlock(String u, Object request) {
         // 以下都是聊天页/个人页展示必需的数据，放行
         if (u.contains("ht_im/sock")) return false;
         if (u.contains("p2p-chat/to-user-chat")) return false;
-        if (u.contains("profile/v2/userinfo")) return false;
         if (u.contains("profile/v1/get_pay_chat_info")) return false;
         if (u.contains("livehub/user/status")) return false;
+
+        // userinfo 按 body 指纹去重：相同 body 2秒内只放行一次，不同 body 各自放行
+        if (u.contains("profile/v2/userinfo")) {
+            String fp = getBodyFingerprint(request);
+            String key = (fp != null) ? fp : u;
+            long now = System.currentTimeMillis();
+            Long last = userinfoDedup.get(key);
+            if (last != null && now - last < USERINFO_DEDUP_MS) {
+                return true; // 相同 body 重复，拦截
+            }
+            userinfoDedup.put(key, now);
+            return false; // 放行第一次
+        }
 
         for (String p : BLOCK_PATHS) {
             if (u.contains(p)) return true;
@@ -194,12 +211,18 @@ public class HookEntry implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    String u = getUrlFromRealCall(param.thisObject);
-                    if (u == null) {
+                    // execute 是同步请求，放行（拦截会抛异常弹网络错误）
+                    if ("execute".equals(param.method.getName())) {
+                        return;
+                    }
+                    Object request = getRequestFromRealCall(param.thisObject);
+                    if (request == null) {
                         logRealCallDiagnosticsOnce(param.thisObject);
                         return;
                     }
-                    boolean block = shouldBlockUrl(u);
+                    String u = getUrlFromRequest(request);
+                    if (u == null) return;
+                    boolean block = shouldBlock(u, request);
                     logUrlOnce(u, block, param.method.getName());
                     if (block) {
                         blockRequest(param);
@@ -284,27 +307,73 @@ public class HookEntry implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static String getUrlFromRealCall(Object call) {
+    private static Object getRequestFromRealCall(Object call) {
         if (call == null) return null;
-        // request() 方法拿 Request 对象，再取完整 URL（含路径）
         try {
             Object req = XposedHelpers.callMethod(call, "request");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
-        // getOriginalRequest()
         try {
             Object req = XposedHelpers.callMethod(call, "getOriginalRequest");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
-        // originalRequest 字段
         try {
             Object req = XposedHelpers.getObjectField(call, "originalRequest");
-            String u = getUrlFromRequest(req);
-            if (u != null) return u;
+            if (req != null) return req;
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static String getUrlFromRealCall(Object call) {
+        return getUrlFromRequest(getRequestFromRealCall(call));
+    }
+
+    /** 从 Request 对象提取 body 字节指纹（前32字节hex + 长度），用于 userinfo 按内容去重。 */
+    private static String getBodyFingerprint(Object request) {
+        if (request == null) return null;
+        try {
+            for (Class<?> c = request.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    f.setAccessible(true);
+                    Object v;
+                    try { v = f.get(request); } catch (Throwable ignored) { continue; }
+                    if (v == null) continue;
+                    String hex = extractBytesFingerprint(v);
+                    if (hex != null) return hex;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String extractBytesFingerprint(Object obj) {
+        if (obj == null) return null;
+        // 自身就是 byte[]
+        if (obj instanceof byte[]) {
+            return bytesToFingerprint((byte[]) obj);
+        }
+        // 遍历其字段找 byte[]
+        try {
+            for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType() == byte[].class) {
+                        f.setAccessible(true);
+                        byte[] b = (byte[]) f.get(obj);
+                        if (b != null && b.length > 0) return bytesToFingerprint(b);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static String bytesToFingerprint(byte[] b) {
+        int n = Math.min(32, b.length);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            sb.append(String.format("%02x", b[i]));
+        }
+        return sb.append('#').append(b.length).toString();
     }
 
     private static volatile boolean diagLogged = false;

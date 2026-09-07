@@ -10,8 +10,8 @@ android {
         applicationId = "com.htspeedup"
         minSdk = 27
         targetSdk = 34
-        versionCode = 10
-        versionName = "1.9"
+        versionCode = 11
+        versionName = "2.0"
     }
 
     buildTypes {
