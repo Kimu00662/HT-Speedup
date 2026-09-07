@@ -26,10 +26,27 @@ public class HookEntry implements IXposedHookLoadPackage {
         "notification-settings",
         "ali_log_token",
         "report_logic",
+        "online_status",
+        "focus_info",
+        "chat_plan",
+        "emoji_rain",
+        "vip_gift",
+        "send_gift",
+        "closed_friend",
+        "bubble_tips",
+        "voice_input",
+        "translate_config",
     };
 
     private static volatile long lastUserinfoTs = 0;
     private static final long USERINFO_DEDUP_MS = 30_000;
+
+    private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            param.setResult(null);
+        }
+    };
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -37,6 +54,13 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         XposedBridge.log(TAG + " 模块已加载");
 
+        hookOkHttp(lpp);
+        hookChatPage(lpp);
+
+        XposedBridge.log(TAG + " 钩子安装完成");
+    }
+
+    private void hookOkHttp(XC_LoadPackage.LoadPackageParam lpp) {
         Class<?> realCall = null;
         try {
             realCall = XposedHelpers.findClass("okhttp3.internal.connection.RealCall", lpp.classLoader);
@@ -95,8 +119,53 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + " hook enqueue 失败: " + t2.getMessage());
             }
         }
+    }
 
-        XposedBridge.log(TAG + " 钩子安装完成");
+    private void hookChatPage(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> fragmentClass = XposedHelpers.findClass(
+                "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
+
+            hookVoidMethod(fragmentClass, "T3");
+            hookVoidMethod(fragmentClass, "R3");
+
+            try {
+                XposedHelpers.findAndHookMethod(fragmentClass, "S3", boolean.class, NOOP_HOOK);
+            } catch (Throwable ignored) {}
+
+            try {
+                XposedHelpers.findAndHookMethod(fragmentClass, "F3", boolean.class, NOOP_HOOK);
+            } catch (Throwable ignored) {}
+
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
+        }
+
+        try {
+            Class<?> vmClass = XposedHelpers.findClass("ha4", lpp.classLoader);
+
+            try {
+                Class<?> tc2Class = XposedHelpers.findClass("tc2", lpp.classLoader);
+                XposedHelpers.findAndHookMethod(vmClass, "R", tc2Class, NOOP_HOOK);
+            } catch (Throwable ignored) {}
+
+            try {
+                XposedHelpers.findAndHookMethod(vmClass, "P", int.class, int.class, NOOP_HOOK);
+            } catch (Throwable ignored) {}
+
+            try {
+                XposedHelpers.findAndHookMethod(vmClass, "A", java.util.List.class, NOOP_HOOK);
+            } catch (Throwable ignored) {}
+
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook ChatDetailViewModel 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookVoidMethod(Class<?> clazz, String methodName) {
+        try {
+            XposedHelpers.findAndHookMethod(clazz, methodName, NOOP_HOOK);
+        } catch (Throwable ignored) {}
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
@@ -111,3 +180,5 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 }
+
+</parameter>
