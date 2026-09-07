@@ -103,6 +103,18 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final ConcurrentHashMap<String, Long> toUserChatDedup = new ConcurrentHashMap<>();
     private static final long TO_USER_CHAT_DEDUP_MS = 15_000;
 
+    // 记住当前 ChatDetailFragment 的 userId
+    private static final java.lang.ThreadLocal<Integer> CHAT_USER_ID =
+        new java.lang.ThreadLocal<Integer>() {
+            @Override
+            protected Integer initialValue() {
+                return 0;
+            }
+        };
+
+    // 缓存用户信息查询时间（userId -> 最后查询时间）
+    private static final ConcurrentHashMap<Integer, Long> userinfoQueryCache = new ConcurrentHashMap<>();
+
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
@@ -119,6 +131,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookApplication(lpp);
         hookUserInfoProvider(lpp);
         hookTitleController(lpp);
+        hookChatDetailFragment(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -204,6 +217,49 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    private void hookChatDetailFragment(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> fragClass = XposedHelpers.findClass(
+                "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
+
+            // 记住进入聊天页时的对方 userId
+            XposedBridge.hookAllMethods(fragClass, "setArguments", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        android.os.Bundle bundle = (android.os.Bundle) param.args[0];
+                        if (bundle != null) {
+                            int userId = bundle.getInt("user_id", 0);
+                            if (userId > 0) {
+                                CHAT_USER_ID.set(userId);
+                                XposedBridge.log(TAG + " ChatFragment userId=" + userId);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " setArguments error: " + t.getMessage());
+                    }
+                }
+            });
+
+            XposedBridge.log(TAG + " hook ChatDetailFragment.setArguments 成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook ChatDetailFragment failed: " + t.getMessage());
+        }
+    }
+
+    private static int parseUserIdFromUrl(String u) {
+        try {
+            int idPos = u.indexOf("id=");
+            if (idPos >= 0) {
+                int endPos = u.indexOf("&", idPos);
+                if (endPos < 0) endPos = u.length();
+                String idStr = u.substring(idPos + 3, endPos);
+                return Integer.parseInt(idStr);
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
     private void hookNewCall(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> clientClass = XposedHelpers.findClass("okhttp3.OkHttpClient", lpp.classLoader);
@@ -234,9 +290,26 @@ public class HookEntry implements IXposedHookLoadPackage {
         // IM 长连接，放行
         if (u.contains("ht_im/sock")) return false;
 
-        // userinfo 完全放行：由 hook Lyrv.g 的 mode=1（缓存优先）控制加载策略，
-        // 缓存 miss 时的网络补充需要能正常走，所以这里不做任何去重拦截。
-        if (u.contains("profile/v2/userinfo")) return false;
+        // userinfo 智能去重
+        if (u.contains("profile/v2/userinfo")) {
+            int chatUserId = CHAT_USER_ID.get();
+            int targetUserId = parseUserIdFromUrl(u);
+
+            if (chatUserId > 0 && targetUserId == chatUserId) {
+                long now = System.currentTimeMillis();
+                Long lastQuery = userinfoQueryCache.get(targetUserId);
+
+                if (lastQuery != null && now - lastQuery < 15_000) {
+                    XposedBridge.log(TAG + " userinfo 拦截重复查询: user_id=" + targetUserId);
+                    return true;
+                }
+
+                userinfoQueryCache.put(targetUserId, now);
+                return false;
+            }
+
+            return false;
+        }
 
         // to-user-chat 按完整 URL 去重（URL 含 user_id，自然区分不同会话）
         if (u.contains("p2p-chat/to-user-chat")) {
