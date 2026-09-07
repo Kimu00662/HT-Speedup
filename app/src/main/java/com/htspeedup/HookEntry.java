@@ -106,7 +106,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     // userinfo 按 body 指纹去重：body 指纹 -> 上次放行时间
     private static final ConcurrentHashMap<String, Long> userinfoDedup = new ConcurrentHashMap<>();
-    private static final long USERINFO_DEDUP_MS = 3000;
+    private static final long USERINFO_DEDUP_MS = 300000;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -443,14 +443,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        IOException ex = new IOException(TAG + " blocked");
-        if ("execute".equals(param.method.getName())) {
-            param.setThrowable(ex);
-        } else {
-            try {
-                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
-            } catch (Throwable ignored) {}
-            param.setResult(null);
-        }
+        // 只处理 enqueue（execute 已在 hook 里提前放行）
+        // 静默丢弃：不回调 onFailure，app 收不到失败通知，不会弹网络错误提示
+        param.setResult(null);
     }
 }
