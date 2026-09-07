@@ -98,6 +98,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         "settle_center",
     };
 
+    private static volatile long lastUserinfoTs = 0;
+    private static final long USERINFO_DEDUP_MS = 10_000;
+
+    private static volatile long lastToUserChatTs = 0;
+    private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
+
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
@@ -192,12 +198,28 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** 返回 true 表示应拦截。集中处理白名单/黑名单。 */
+    /** 返回 true 表示应拦截。集中处理白名单/去重/黑名单。 */
     private static boolean shouldBlockUrl(String u) {
-        // 以下都是聊天页/个人页展示必需或走缓存方案的请求，放行
+        // IM 长连接，放行
         if (u.contains("ht_im/sock")) return false;
-        if (u.contains("p2p-chat/to-user-chat")) return false;
-        if (u.contains("profile/v2/userinfo")) return false;
+
+        // to-user-chat 去重：10 秒内只放行第一次（秒进的关键）
+        if (u.contains("p2p-chat/to-user-chat")) {
+            long now = System.currentTimeMillis();
+            if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
+            lastToUserChatTs = now;
+            return false;
+        }
+
+        // userinfo 去重：10 秒内只放行第一次。
+        // 在线状态由 IM 推送实时写库（标题栏走 mode=1 缓存读本地 DB），
+        // 所以 HTTP 层去重拦截不会导致在线状态失真，反而带来秒进。
+        if (u.contains("profile/v2/userinfo")) {
+            long now = System.currentTimeMillis();
+            if (now - lastUserinfoTs < USERINFO_DEDUP_MS) return true;
+            lastUserinfoTs = now;
+            return false;
+        }
 
         for (String p : BLOCK_PATHS) {
             if (u.contains(p)) return true;
