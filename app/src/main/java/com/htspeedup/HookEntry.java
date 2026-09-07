@@ -36,6 +36,17 @@ public class HookEntry implements IXposedHookLoadPackage {
         "bubble_tips",
         "voice_input",
         "translate_config",
+        "get_pay_chat_info",
+        "livehub/user/status",
+        "get_latest_chat_plans",
+        "chat_list_banner",
+        "vip_trial/banner",
+        "login_config/business/vip_product",
+        "chat_magic_wand",
+        "click_word_magic_wand",
+        "publishing_skills",
+        "vip_page_banner",
+        "vip_page_content",
     };
 
     private static volatile long lastUserinfoTs = 0;
