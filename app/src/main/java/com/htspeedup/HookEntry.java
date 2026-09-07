@@ -118,6 +118,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         hookApplication(lpp);
         hookUserInfoProvider(lpp);
+        hookTitleController(lpp);
         hookNewCall(lpp);
         hookRealCall(lpp);
         hookChatPage(lpp);
@@ -172,6 +173,34 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " hook UserInfoProvider.load(g) 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
+        }
+    }
+
+    private void hookTitleController(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> pitClass = XposedHelpers.findClass("pit", lpp.classLoader);
+
+            XposedBridge.hookAllMethods(pitClass, "M", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object titleController = param.thisObject;
+                        Object userOnline = XposedHelpers.getObjectField(titleController, "i");
+                        Object baseInfo = XposedHelpers.getObjectField(titleController, "k");
+
+                        // 缓存有效就跳过查询
+                        if (userOnline != null && baseInfo != null) {
+                            param.setResult(null);
+                            XposedBridge.log(TAG + " 标题栏本地缓存有效，跳过查询");
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " Lpit.M() hook error: " + t.getMessage());
+                    }
+                }
+            });
+            XposedBridge.log(TAG + " hook Lpit.M() 成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook title controller failed: " + t.getMessage());
         }
     }
 
