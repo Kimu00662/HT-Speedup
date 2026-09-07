@@ -40,9 +40,9 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static volatile long lastToUserChatTs = 0;
     private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
-    
+
     private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
-    
+
     private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
     private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
 
@@ -61,7 +61,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         hookApplication(lpp);
         hookUserInfoProviderLoad(lpp);
-        hookErrorToastSuppression(lpp);
+        hookNetworkTimeoutToastSuppression(lpp);   // ← 新增：精确屏蔽网络超时黑框
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -85,72 +85,53 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private void hookErrorToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
+    /**
+     * 精确屏蔽黑框“网络超时，请重试 / 網絡超時，請重試 / ネットワークが途絶えました…”。
+     * 这三条文案是同一个资源 ID：0x7f141387 (network_timed_out_retry)。
+     * 统一显示出口：gm6.o(int resId, Context) → SimpleToast。
+     * 只拦截这个 resId，其它提示不动。
+     */
+    private void hookNetworkTimeoutToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            Class<?> toastClass = XposedHelpers.findClass("android.widget.Toast", lpp.classLoader);
-            XposedBridge.hookAllMethods(toastClass, "show", new XC_MethodHook() {
+            Class<?> gm6Class = XposedHelpers.findClass("gm6", lpp.classLoader);
+            XposedBridge.hookAllMethods(gm6Class, "o", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        Object toast = param.thisObject;
-                        Object view = XposedHelpers.getObjectField(toast, "mNextView");
-                        
-                        if (view != null && view instanceof android.view.ViewGroup) {
-                            String toastText = extractToastText((android.view.ViewGroup) view);
-                            
-                            if (toastText != null && (
-                                toastText.contains("网络错误") ||
-                                toastText.contains("Network error") ||
-                                toastText.contains("Network Error") ||
-                                toastText.contains("ネットワークが途絶えました") ||
-                                toastText.contains("ネットワーク") ||
-                                toastText.contains("Error") ||
-                                toastText.contains("error") ||
-                                toastText.contains("エラー")
-                            )) {
-                                param.setResult(null);
-                                XposedBridge.log(TAG + " 已隐藏网络错误 Toast: " + toastText);
-                                return;
-                            }
+                        if (param.args == null || param.args.length < 1) return;
+                        Object resIdObj = param.args[0];
+                        if (!(resIdObj instanceof Integer)) return;
+                        int resId = (Integer) resIdObj;
+                        // 只屏蔽“网络超时”黑框
+                        if (resId == 0x7f141387) {
+                            param.setResult(null);
+                            XposedBridge.log(TAG + " 已屏蔽网络超时黑框 (0x7f141387)");
                         }
                     } catch (Throwable t) {
                         // ignored
                     }
                 }
             });
-            
-            XposedBridge.log(TAG + " hook 网络错误 Toast 拦截成功");
+            XposedBridge.log(TAG + " hook gm6.o 网络超时黑框拦截成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook 网络错误 Toast 拦截失败: " + t.getMessage());
+            XposedBridge.log(TAG + " hook gm6.o 失败: " + t.getMessage());
         }
-    }
-
-    private static String extractToastText(android.view.ViewGroup view) {
-        try {
-            for (int i = 0; i < view.getChildCount(); i++) {
-                android.view.View child = view.getChildAt(i);
-                if (child instanceof android.widget.TextView) {
-                    return ((android.widget.TextView) child).getText().toString();
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
     }
 
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> yrvClass = XposedHelpers.findClass("yrv", lpp.classLoader);
-            
+
             XposedBridge.hookAllMethods(yrvClass, "b", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         if (param.args == null || param.args.length < 5) return;
-                        
+
                         Object userIdObj = param.args[0];
                         if (!(userIdObj instanceof Integer)) return;
                         int userId = (Integer) userIdObj;
-                        
+
                         if (hasEnoughCache(yrvClass, userId)) {
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
@@ -159,7 +140,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                                 return;
                             }
                         }
-                        
+
                         long now = System.currentTimeMillis();
                         Long lastQuery = userinfoQueryRecord.get(userId);
                         if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
@@ -170,14 +151,14 @@ public class HookEntry implements IXposedHookLoadPackage {
                                 return;
                             }
                         }
-                        
+
                         userinfoQueryRecord.put(userId, now);
                     } catch (Throwable t) {
                         XposedBridge.log(TAG + " userinfo provider hook error: " + t.getMessage());
                     }
                 }
             });
-            
+
             XposedBridge.log(TAG + " hook UserInfoProvider.b() 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook UserInfoProvider 失败: " + t.getMessage());
@@ -188,16 +169,16 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
             if (provider == null) return false;
-            
+
             Object cache = XposedHelpers.getObjectField(provider, "d");
             if (cache == null) return false;
-            
+
             Object cachedData = XposedHelpers.callMethod(cache, "c", (Integer) userId);
             if (cachedData == null) return false;
-            
+
             Object baseInfo = XposedHelpers.callMethod(cachedData, "d");
             Object userOnline = XposedHelpers.callMethod(cachedData, "u");
-            
+
             return baseInfo != null && userOnline != null;
         } catch (Throwable t) {
             return false;
@@ -208,10 +189,10 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
             if (provider == null) return null;
-            
+
             Object cache = XposedHelpers.getObjectField(provider, "d");
             if (cache == null) return null;
-            
+
             return XposedHelpers.callMethod(cache, "c", (Integer) userId);
         } catch (Throwable t) {
             return null;
@@ -221,7 +202,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private void hookTitleController(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> pitClass = XposedHelpers.findClass("pit", lpp.classLoader);
-            
+
             XposedBridge.hookAllMethods(pitClass, "M", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -229,7 +210,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         Object titleController = param.thisObject;
                         Object userOnline = XposedHelpers.getObjectField(titleController, "i");
                         Object baseInfo = XposedHelpers.getObjectField(titleController, "k");
-                        
+
                         if (userOnline != null && baseInfo != null) {
                             param.setResult(null);
                             XposedBridge.log(TAG + " 标题栏缓存充分，跳过查询");
@@ -239,7 +220,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                     }
                 }
             });
-            
+
             XposedBridge.log(TAG + " hook Lpit.M() 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook title failed: " + t.getMessage());
@@ -250,7 +231,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Class<?> fragClass = XposedHelpers.findClass(
                 "com.hellotalk.talk.detail.fragment.ChatDetailFragment", lpp.classLoader);
-            
+
             XposedBridge.hookAllMethods(fragClass, "setArguments", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -268,7 +249,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                     }
                 }
             });
-            
+
             XposedBridge.log(TAG + " hook ChatDetailFragment 成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook ChatDetailFragment 失败: " + t.getMessage());
@@ -384,7 +365,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
         try {
             if (param.args != null && param.args.length > 0) {
-                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, 
+                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject,
                     new IOException(TAG + " blocked"));
             }
         } catch (Throwable ignored) {}
