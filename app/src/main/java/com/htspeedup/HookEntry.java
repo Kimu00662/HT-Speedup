@@ -61,6 +61,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         hookApplication(lpp);
         hookUserInfoProviderLoad(lpp);
+        hookErrorToastSuppression(lpp);  // ← 新增：只隐藏错误提示，不改拦截逻辑
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -82,6 +83,75 @@ public class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook Application 失败: " + t.getMessage());
         }
+    }
+
+    // ★ 新增：隐藏所有"网络错误"相关的 Toast，不改变原有请求流程
+    private void hookErrorToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            // hook Lkim 的错误日志和 Toast 相关方法
+            Class<?> kimClass = XposedHelpers.findClass("kim", lpp.classLoader);
+            
+            // 方法 b：可能包含 onError 的处理和 Toast 显示
+            XposedBridge.hookAllMethods(kimClass, "b", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        // 这里会执行原方法，但我们通过下面对 Toast.show() 的 hook 来拦截显示
+                        XposedBridge.log(TAG + " 拦截 Lkim.b() 的网络错误 Toast");
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+            
+            // hook Toast.show()，拦截包含"网络错误"字样的消息
+            Class<?> toastClass = XposedHelpers.findClass("android.widget.Toast", lpp.classLoader);
+            XposedBridge.hookAllMethods(toastClass, "show", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object toast = param.thisObject;
+                        Object view = XposedHelpers.getObjectField(toast, "mNextView");
+                        
+                        if (view != null && view instanceof android.view.ViewGroup) {
+                            String toastText = extractToastText((android.view.ViewGroup) view);
+                            
+                            // 拦截所有包含错误关键词的 Toast
+                            if (toastText != null && (
+                                toastText.contains("网络错误") ||
+                                toastText.contains("Network error") ||
+                                toastText.contains("Network Error") ||
+                                toastText.contains("错误") ||
+                                toastText.contains("error") ||
+                                toastText.contains("Error")
+                            )) {
+                                param.setResult(null);  // 不显示这个 Toast
+                                XposedBridge.log(TAG + " 已隐藏网络错误 Toast: " + toastText);
+                                return;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+            
+            XposedBridge.log(TAG + " hook 网络错误 Toast 拦截成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook 网络错误 Toast 拦截失败: " + t.getMessage());
+        }
+    }
+
+    private static String extractToastText(android.view.ViewGroup view) {
+        try {
+            for (int i = 0; i < view.getChildCount(); i++) {
+                android.view.View child = view.getChildAt(i);
+                if (child instanceof android.widget.TextView) {
+                    return ((android.widget.TextView) child).getText().toString();
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
@@ -250,9 +320,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static boolean shouldBlockUrl(String u) {
         if (u.contains("ht_im/sock")) return false;
 
-        // ★ 个人资料页的 userinfo 请求必须放行
-        if (u.contains("profile/v2/userinfo")) return false;
-
         if (u.contains("p2p-chat/to-user-chat")) {
             long now = System.currentTimeMillis();
             if (now - lastToUserChatTs < TO_USER_CHAT_DEDUP_MS) return true;
@@ -332,6 +399,12 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param.args != null && param.args.length > 0) {
+                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, 
+                    new IOException(TAG + " blocked"));
+            }
+        } catch (Throwable ignored) {}
         param.setResult(null);
     }
 
