@@ -41,12 +41,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile long lastToUserChatTs = 0;
     private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
     
-    // 记住当前聊天的 userId
     private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
     
-    // userinfo 查询去重：userId -> 上次查询时间
     private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
-    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;  // 20秒内不重复查同一用户
+    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
 
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
@@ -62,7 +60,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
-        hookUserInfoProviderLoad(lpp);      // ← 这是秒进的关键
+        hookUserInfoProviderLoad(lpp);
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -86,26 +84,21 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    // ★ 秒进的核心：hook Lyrv.b()，判断本地缓存充分就直接返回，不走协程查询
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> yrvClass = XposedHelpers.findClass("yrv", lpp.classLoader);
             
-            // hook b(int userId, List fields, int mode, orv callback, r06 continuation)
             XposedBridge.hookAllMethods(yrvClass, "b", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        // 参数: args[0]=userId, args[1]=fields, args[2]=mode, args[3]=callback, args[4]=continuation
                         if (param.args == null || param.args.length < 5) return;
                         
                         Object userIdObj = param.args[0];
                         if (!(userIdObj instanceof Integer)) return;
                         int userId = (Integer) userIdObj;
                         
-                        // 检查本地缓存是否充分
                         if (hasEnoughCache(yrvClass, userId)) {
-                            // 本地缓存充分，直接返回缓存对象，不启动协程
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -114,11 +107,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
                         }
                         
-                        // 缓存不足，让原方法走协程查询，但限制去重
                         long now = System.currentTimeMillis();
                         Long lastQuery = userinfoQueryRecord.get(userId);
                         if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
-                            // 20秒内已查过，跳过网络查询，用缓存返回
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -140,33 +131,26 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    // 检查本地缓存是否充分（有 UserBaseInfo 和 UserOnline）
     private static boolean hasEnoughCache(Class<?> yrvClass, int userId) {
         try {
-            // 获取 Lyrv 单例
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
             if (provider == null) return false;
             
-            // 读 Lyrv.d (内存缓存 w1i)
             Object cache = XposedHelpers.getObjectField(provider, "d");
             if (cache == null) return false;
             
-            // 查缓存里有没有这个 userId 的数据
             Object cachedData = XposedHelpers.callMethod(cache, "c", (Integer) userId);
             if (cachedData == null) return false;
             
-            // 检查 UserInfoModel 里是否有必要字段
-            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");  // UserBaseInfo
-            Object userOnline = XposedHelpers.callMethod(cachedData, "u");  // UserOnline
+            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");
+            Object userOnline = XposedHelpers.callMethod(cachedData, "u");
             
-            // 都有就认为缓存充分
             return baseInfo != null && userOnline != null;
         } catch (Throwable t) {
             return false;
         }
     }
 
-    // 从本地缓存取 UserInfoModel
     private static Object getCachedUserInfo(Class<?> yrvClass, int userId) {
         try {
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
@@ -345,12 +329,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        try {
-            if (param.args != null && param.args.length > 0) {
-                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, 
-                    new IOException(TAG + " blocked"));
-            }
-        } catch (Throwable ignored) {}
+        // 静默拦截：不调 onFailure，直接返回空 Call，app 认为请求成功但没数据
+        // 这样不会弹网络错误提示
         param.setResult(null);
     }
 
