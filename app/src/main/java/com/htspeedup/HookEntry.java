@@ -61,7 +61,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         hookApplication(lpp);
         hookUserInfoProviderLoad(lpp);
-        hookErrorToastSuppression(lpp);  // ← 新增：只隐藏错误提示，不改拦截逻辑
+        hookErrorToastSuppression(lpp);
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -85,26 +85,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    // ★ 新增：隐藏所有"网络错误"相关的 Toast，不改变原有请求流程
     private void hookErrorToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
         try {
-            // hook Lkim 的错误日志和 Toast 相关方法
-            Class<?> kimClass = XposedHelpers.findClass("kim", lpp.classLoader);
-            
-            // 方法 b：可能包含 onError 的处理和 Toast 显示
-            XposedBridge.hookAllMethods(kimClass, "b", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        // 这里会执行原方法，但我们通过下面对 Toast.show() 的 hook 来拦截显示
-                        XposedBridge.log(TAG + " 拦截 Lkim.b() 的网络错误 Toast");
-                    } catch (Throwable t) {
-                        // ignored
-                    }
-                }
-            });
-            
-            // hook Toast.show()，拦截包含"网络错误"字样的消息
             Class<?> toastClass = XposedHelpers.findClass("android.widget.Toast", lpp.classLoader);
             XposedBridge.hookAllMethods(toastClass, "show", new XC_MethodHook() {
                 @Override
@@ -116,16 +98,17 @@ public class HookEntry implements IXposedHookLoadPackage {
                         if (view != null && view instanceof android.view.ViewGroup) {
                             String toastText = extractToastText((android.view.ViewGroup) view);
                             
-                            // 拦截所有包含错误关键词的 Toast
                             if (toastText != null && (
                                 toastText.contains("网络错误") ||
                                 toastText.contains("Network error") ||
                                 toastText.contains("Network Error") ||
-                                toastText.contains("错误") ||
+                                toastText.contains("ネットワークが途絶えました") ||
+                                toastText.contains("ネットワーク") ||
+                                toastText.contains("Error") ||
                                 toastText.contains("error") ||
-                                toastText.contains("Error")
+                                toastText.contains("エラー")
                             )) {
-                                param.setResult(null);  // 不显示这个 Toast
+                                param.setResult(null);
                                 XposedBridge.log(TAG + " 已隐藏网络错误 Toast: " + toastText);
                                 return;
                             }
