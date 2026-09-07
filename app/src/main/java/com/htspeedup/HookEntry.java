@@ -225,7 +225,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                     boolean block = shouldBlock(u, request);
                     logUrlOnce(u, block, param.method.getName());
                     if (block) {
-                        blockRequest(param);
+                        blockRequest(param, u);
                     }
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + " RealCall hook 异常: " + t.getMessage());
@@ -442,9 +442,17 @@ public class HookEntry implements IXposedHookLoadPackage {
         try { XposedHelpers.findAndHookMethod(clazz, name, NOOP_HOOK); } catch (Throwable ignored) {}
     }
 
-    private static void blockRequest(XC_MethodHook.MethodHookParam param) {
-        // 只处理 enqueue（execute 已在 hook 里提前放行）
-        // 静默丢弃：不回调 onFailure，app 收不到失败通知，不会弹网络错误提示
-        param.setResult(null);
+    private static void blockRequest(XC_MethodHook.MethodHookParam param, String url) {
+        if (url != null && url.contains("profile/v2/userinfo")) {
+            // userinfo 去重拦截：调 onFailure 让 app 走本地缓存兜底（断网时秒进显示头像星座的机制）
+            IOException ex = new IOException(TAG + " dedup");
+            try {
+                XposedHelpers.callMethod(param.args[0], "onFailure", param.thisObject, ex);
+            } catch (Throwable ignored) {}
+            param.setResult(null);
+        } else {
+            // 纯冗余请求：静默丢弃，不回调 onFailure（否则 app 弹网络错误提示）
+            param.setResult(null);
+        }
     }
 }
