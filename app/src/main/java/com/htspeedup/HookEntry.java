@@ -11,7 +11,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class HookEntry implements IXposedHookLoadPackage {
 
-    private static final String TAG = "HT_Speedup";
+    private static final String TAG = "HT_Diag";
 
     private static final String[] BLOCK_PATHS = {
         "shortflix_api", "livehub/channel_list", "get_thirtysix_question",
@@ -70,9 +70,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log(TAG + " ===== 模块开始加载 =====");
+        XposedBridge.log(TAG + " ===== 诊断模块开始加载 =====");
 
-        hookApplication(lpp);
+        hookDiagnostics(lpp);
         hookUserInfoProviderLoad(lpp);
         hookNetworkTimeoutToastSuppression(lpp);
         hookTitleController(lpp);
@@ -81,34 +81,179 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookRealCall(lpp);
         hookChatPage(lpp);
 
-        XposedBridge.log(TAG + " ===== 钩子安装完成 =====");
+        XposedBridge.log(TAG + " ===== 诊断钩子安装完成 =====");
     }
 
-    private void hookApplication(
+    /**
+     * 诊断核心。
+     *
+     * 目标：测量后台切回时，到底卡在哪个阶段。
+     */
+    private void hookDiagnostics(
         XC_LoadPackage.LoadPackageParam lpp
     ) {
         try {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Application",
-                lpp.classLoader,
-                "onCreate",
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(
-                        MethodHookParam param
-                    ) {
-                        XposedBridge.log(
-                            TAG + " Application.onCreate 激活"
-                        );
-                    }
-                }
+            final Class<?> mainActivity = XposedHelpers.findClass(
+                "com.hellotalk.lib.main.home.ui.MainTabV3Activity",
+                lpp.classLoader
             );
+
+            final Class<?> launchActivity = XposedHelpers.findClass(
+                "com.hellotalk.lib.main.launch.ui.LaunchActivity",
+                lpp.classLoader
+            );
+
+            /*
+             * MainTabV3Activity 生命周期时间戳。
+             */
+            hookTime(mainActivity, "onCreate",
+                new String[]{"android.os.Bundle"});
+            hookTime(mainActivity, "onStart", null);
+            hookTime(mainActivity, "onResume", null);
+            hookTime(mainActivity, "onPause", null);
+            hookTime(mainActivity, "onStop", null);
+            hookTime(mainActivity, "onWindowFocusChanged",
+                new String[]{"boolean"});
+
+            /*
+             * LaunchActivity 生命周期时间戳。
+             *
+             * 用于确认切回时 LaunchActivity 是否被重新创建。
+             */
+            hookTime(launchActivity, "onCreate",
+                new String[]{"android.os.Bundle"});
+            hookTime(launchActivity, "onResume", null);
+            hookTime(launchActivity, "onPause", null);
+            hookTime(launchActivity, "onWindowFocusChanged",
+                new String[]{"boolean"});
+
+            XposedBridge.log(TAG + " 生命周期诊断钩子安装成功");
         } catch (Throwable t) {
             XposedBridge.log(
-                TAG + " hook Application 失败: "
+                TAG + " 生命周期诊断钩子安装失败: "
                     + t.getMessage()
             );
         }
+    }
+
+    private void hookTime(
+        final Class<?> clazz,
+        final String methodName,
+        final String[] paramTypes
+    ) {
+        try {
+            Object[] paramsAndHook = null;
+
+            if (paramTypes == null) {
+                XposedHelpers.findAndHookMethod(
+                    clazz,
+                    methodName,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 开始"
+                            );
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 结束"
+                            );
+                        }
+                    }
+                );
+            } else if ("boolean".equals(paramTypes[0])) {
+                XposedHelpers.findAndHookMethod(
+                    clazz,
+                    methodName,
+                    boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 开始 hasFocus="
+                                    + param.args[0]
+                            );
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 结束 hasFocus="
+                                    + param.args[0]
+                            );
+                        }
+                    }
+                );
+            } else {
+                XposedHelpers.findAndHookMethod(
+                    clazz,
+                    methodName,
+                    android.os.Bundle.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 开始"
+                            );
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(
+                            MethodHookParam param
+                        ) {
+                            logTime(
+                                clazz.getSimpleName()
+                                    + "." + methodName
+                                    + " 结束"
+                            );
+                        }
+                    }
+                );
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(
+                TAG
+                    + " 无法 hook "
+                    + clazz.getSimpleName()
+                    + "."
+                    + methodName
+                    + ": "
+                    + t.getMessage()
+            );
+        }
+    }
+
+    private static void logTime(String message) {
+        XposedBridge.log(
+            TAG
+                + " ["
+                + System.currentTimeMillis()
+                + "] "
+                + message
+        );
     }
 
     private void hookNetworkTimeoutToastSuppression(
@@ -144,12 +289,6 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                             if (resId == 0x7f141387) {
                                 param.setResult(null);
-
-                                XposedBridge.log(
-                                    TAG
-                                        + " 已屏蔽网络超时黑框"
-                                        + " (0x7f141387)"
-                                );
                             }
                         } catch (Throwable ignored) {
                         }
@@ -158,7 +297,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             );
 
             XposedBridge.log(
-                TAG + " hook gm6.o 网络超时黑框拦截成功"
+                TAG + " hook gm6.o 成功"
             );
         } catch (Throwable t) {
             XposedBridge.log(
@@ -208,14 +347,6 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                                 if (cachedData != null) {
                                     param.setResult(cachedData);
-
-                                    XposedBridge.log(
-                                        TAG
-                                            + " userinfo 本地缓存秒回: "
-                                            + "userId="
-                                            + userId
-                                    );
-
                                     return;
                                 }
                             }
@@ -235,24 +366,12 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                                 if (cachedData != null) {
                                     param.setResult(cachedData);
-
-                                    XposedBridge.log(
-                                        TAG
-                                            + " userinfo 去重: userId="
-                                            + userId
-                                    );
-
                                     return;
                                 }
                             }
 
                             userinfoQueryRecord.put(userId, now);
-                        } catch (Throwable t) {
-                            XposedBridge.log(
-                                TAG
-                                    + " userinfo provider hook error: "
-                                    + t.getMessage()
-                            );
+                        } catch (Throwable ignored) {
                         }
                     }
                 }
@@ -263,8 +382,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             );
         } catch (Throwable t) {
             XposedBridge.log(
-                TAG
-                    + " hook UserInfoProvider 失败: "
+                TAG + " hook UserInfoProvider 失败: "
                     + t.getMessage()
             );
         }
@@ -394,18 +512,8 @@ public class HookEntry implements IXposedHookLoadPackage {
                             if (userOnline != null
                                 && baseInfo != null) {
                                 param.setResult(null);
-
-                                XposedBridge.log(
-                                    TAG
-                                        + " 标题栏缓存充分，跳过查询"
-                                );
                             }
-                        } catch (Throwable t) {
-                            XposedBridge.log(
-                                TAG
-                                    + " Lpit.M() error: "
-                                    + t.getMessage()
-                            );
+                        } catch (Throwable ignored) {
                         }
                     }
                 }
@@ -414,12 +522,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(
                 TAG + " hook Lpit.M() 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG
-                    + " hook title failed: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
@@ -461,12 +564,6 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                             if (userId > 0) {
                                 CHAT_USER_ID.set(userId);
-
-                                XposedBridge.log(
-                                    TAG
-                                        + " ChatFragment userId="
-                                        + userId
-                                );
                             }
                         } catch (Throwable ignored) {
                         }
@@ -475,15 +572,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             );
 
             XposedBridge.log(
-                TAG
-                    + " hook ChatDetailFragment 成功"
+                TAG + " hook ChatDetailFragment 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG
-                    + " hook ChatDetailFragment 失败: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
@@ -532,12 +623,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(
                 TAG + " hook newCall 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG
-                    + " hook newCall 失败: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
@@ -595,9 +681,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         if (realCall == null) {
-            XposedBridge.log(
-                TAG + " 未找到 RealCall"
-            );
             return;
         }
 
@@ -631,12 +714,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(
                 TAG + " hook RealCall.enqueue 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG
-                    + " hook enqueue 失败: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
@@ -671,10 +749,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                 );
             } catch (Throwable ignored) {
             }
-
-            XposedBridge.log(
-                TAG + " hook ChatDetailFragment 页面方法成功"
-            );
         } catch (Throwable ignored) {
         }
 
@@ -719,10 +793,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                 );
             } catch (Throwable ignored) {
             }
-
-            XposedBridge.log(
-                TAG + " hook ChatDetailViewModel 成功"
-            );
         } catch (Throwable ignored) {
         }
     }
