@@ -2,6 +2,7 @@ package com.htspeedup;
 
 import java.io.IOException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -11,7 +12,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class HookEntry implements IXposedHookLoadPackage {
 
-    private static final String TAG = "HT_Diag";
+    private static final String TAG = "HT_Speedup";
 
     private static final String[] BLOCK_PATHS = {
         "shortflix_api", "livehub/channel_list", "get_thirtysix_question",
@@ -55,6 +56,23 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
 
+    /*
+     * 主界面 MainTabV3Activity 是否已经进入过前台。
+     *
+     * false：第一次冷启动
+     * true：主界面已经显示过，后续 SplashAdActivity 属于热恢复
+     */
+    private static final AtomicBoolean MAIN_ACTIVITY_WAS_RESUMED =
+        new AtomicBoolean(false);
+
+    /*
+     * 是否连冷启动的广告 Splash 也一起跳过。
+     *
+     * false：冷启动保留广告 Splash（默认，符合你的要求）
+     * true：冷启动也跳过，进入主界面更快，但不会显示广告开屏
+     */
+    private static final boolean SKIP_COLD_SPLASH_AD = false;
+
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
@@ -70,9 +88,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log(TAG + " ===== 诊断模块V2开始加载 =====");
+        XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
-        hookActivityDiagnostics(lpp);
+        hookSkipSplashAd(lpp);
         hookUserInfoProviderLoad(lpp);
         hookNetworkTimeoutToastSuppression(lpp);
         hookTitleController(lpp);
@@ -81,165 +99,132 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookRealCall(lpp);
         hookChatPage(lpp);
 
-        XposedBridge.log(TAG + " ===== 诊断V2钩子安装完成 =====");
+        XposedBridge.log(TAG + " ===== 钩子安装完成 =====");
     }
 
     /**
-     * 全局 Hook android.app.Activity 的生命周期。
+     * 核心修复。
      *
-     * MainTabV3Activity 自己没有定义 onPause/onStop/
-     * onWindowFocusChanged，所以之前精确 Hook 失败。
+     * 逆向日志证明：
      *
-     * 这里直接 Hook Activity 基类，只打印 HelloTalk 相关 Activity。
+     * 热恢复时 HelloTalk 会重新启动广告 Splash 页：
+     *
+     * com.hellotalk.lib.ad.core.display.splash.SplashAdActivity
+     *
+     * 流程：
+     * MainTabV3Activity.onResume
+     *     -> 启动 SplashAdActivity
+     *     -> MainTabV3Activity.onPause
+     *     -> SplashAdActivity 显示约 1.2 秒
+     *     -> SplashAdActivity.onPause
+     *     -> MainTabV3Activity.onResume
+     *
+     * 广告没加载出来时，SplashAdActivity 显示默认 HelloTalk 大图标。
+     *
+     * 处理：
+     * 主界面已经进入过前台以后，SplashAdActivity 再创建时直接 finish。
+     * 冷启动时保留，不影响正常启动流程。
      */
-    private void hookActivityDiagnostics(
+    private void hookSkipSplashAd(
         XC_LoadPackage.LoadPackageParam lpp
     ) {
         try {
-            final Class<?> activityClass = XposedHelpers.findClass(
-                "android.app.Activity",
+            final Class<?> mainActivity = XposedHelpers.findClass(
+                "com.hellotalk.lib.main.home.ui.MainTabV3Activity",
                 lpp.classLoader
             );
 
-            XC_MethodHook logHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(
-                    MethodHookParam param
-                ) {
-                    String name = activityName(param);
+            final Class<?> splashAdActivity = XposedHelpers.findClass(
+                "com.hellotalk.lib.ad.core.display.splash.SplashAdActivity",
+                lpp.classLoader
+            );
 
-                    if (name == null) {
-                        return;
-                    }
-
-                    String method = methodName(param);
-
-                    Object arg = null;
-
-                    if (param.args != null
-                        && param.args.length > 0) {
-                        arg = param.args[0];
-                    }
-
-                    XposedBridge.log(
-                        TAG
-                            + " ["
-                            + System.currentTimeMillis()
-                            + "] "
-                            + name
-                            + "."
-                            + method
-                            + " 开始 arg="
-                            + arg
-                    );
-                }
-
-                @Override
-                protected void afterHookedMethod(
-                    MethodHookParam param
-                ) {
-                    String name = activityName(param);
-
-                    if (name == null) {
-                        return;
-                    }
-
-                    String method = methodName(param);
-
-                    Object arg = null;
-
-                    if (param.args != null
-                        && param.args.length > 0) {
-                        arg = param.args[0];
-                    }
-
-                    XposedBridge.log(
-                        TAG
-                            + " ["
-                            + System.currentTimeMillis()
-                            + "] "
-                            + name
-                            + "."
-                            + method
-                            + " 结束 arg="
-                            + arg
-                    );
-                }
-            };
-
+            /*
+             * 记录主界面已经进入过前台。
+             */
             XposedHelpers.findAndHookMethod(
-                activityClass,
+                mainActivity,
                 "onResume",
-                logHook
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                        MethodHookParam param
+                    ) {
+                        MAIN_ACTIVITY_WAS_RESUMED.set(true);
+
+                        XposedBridge.log(
+                            TAG
+                                + " MainTabV3Activity 已进入前台，"
+                                + "后续 SplashAd 按热恢复处理"
+                        );
+                    }
+                }
             );
 
+            /*
+             * 热恢复时跳过 SplashAdActivity。
+             */
             XposedHelpers.findAndHookMethod(
-                activityClass,
-                "onPause",
-                logHook
-            );
+                splashAdActivity,
+                "onCreate",
+                android.os.Bundle.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(
+                        MethodHookParam param
+                    ) {
+                        boolean hotResume =
+                            MAIN_ACTIVITY_WAS_RESUMED.get();
 
-            XposedHelpers.findAndHookMethod(
-                activityClass,
-                "onStop",
-                logHook
-            );
+                        boolean skip =
+                            hotResume || SKIP_COLD_SPLASH_AD;
 
-            XposedHelpers.findAndHookMethod(
-                activityClass,
-                "onWindowFocusChanged",
-                boolean.class,
-                logHook
+                        if (!skip) {
+                            XposedBridge.log(
+                                TAG
+                                    + " 冷启动：保留 SplashAdActivity"
+                            );
+                            return;
+                        }
+
+                        try {
+                            android.app.Activity activity =
+                                (android.app.Activity)
+                                    param.thisObject;
+
+                            activity.finish();
+
+                            /*
+                             * 跳过原始 onCreate，避免它继续初始化广告。
+                             */
+                            param.setResult(null);
+
+                            XposedBridge.log(
+                                TAG
+                                    + (hotResume
+                                        ? " 热恢复：已跳过 SplashAdActivity"
+                                        : " 已跳过 SplashAdActivity")
+                            );
+                        } catch (Throwable t) {
+                            XposedBridge.log(
+                                TAG
+                                    + " 跳过 SplashAdActivity 失败: "
+                                    + t.getMessage()
+                            );
+                        }
+                    }
+                }
             );
 
             XposedBridge.log(
-                TAG + " Activity 全局生命周期诊断安装成功"
+                TAG + " hook SplashAdActivity 跳过安装成功"
             );
         } catch (Throwable t) {
             XposedBridge.log(
-                TAG + " Activity 全局生命周期诊断失败: "
+                TAG
+                    + " hook SplashAdActivity 失败: "
                     + t.getMessage()
             );
-        }
-    }
-
-    private static String activityName(
-        XC_MethodHook.MethodHookParam param
-    ) {
-        try {
-            Object activity = param.thisObject;
-
-            if (activity == null) {
-                return null;
-            }
-
-            String name = activity.getClass().getName();
-
-            if (name == null) {
-                return null;
-            }
-
-            if (name.startsWith("com.hellotalk.")) {
-                return name;
-            }
-
-            return null;
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static String methodName(
-        XC_MethodHook.MethodHookParam param
-    ) {
-        try {
-            if (param.method != null) {
-                return param.method.getName();
-            }
-
-            return "?";
-        } catch (Throwable ignored) {
-            return "?";
         }
     }
 
@@ -284,9 +269,13 @@ public class HookEntry implements IXposedHookLoadPackage {
             );
 
             XposedBridge.log(
-                TAG + " hook gm6.o 成功"
+                TAG + " hook gm6.o 网络超时黑框拦截成功"
             );
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            XposedBridge.log(
+                TAG + " hook gm6.o 失败: "
+                    + t.getMessage()
+            );
         }
     }
 
@@ -662,6 +651,232 @@ public class HookEntry implements IXposedHookLoadPackage {
         if (realCall == null) {
             return;
         }
+
+        final XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(
+                MethodHookParam param
+            ) {
+                try {
+                    String url =
+                        getUrlFromRealCall(
+                            param.thisObject
+                        );
+
+                    if (url != null
+                        && shouldBlockUrl(url)) {
+                        blockRequest(param);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+
+        try {
+            XposedBridge.hookAllMethods(
+                realCall,
+                "enqueue",
+                hook
+            );
+
+            XposedBridge.log(
+                TAG + " hook RealCall.enqueue 成功"
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookChatPage(
+        XC_LoadPackage.LoadPackageParam lpp
+    ) {
+        try {
+            Class<?> frag = XposedHelpers.findClass(
+                "com.hellotalk.talk.detail.fragment.ChatDetailFragment",
+                lpp.classLoader
+            );
+
+            hookVoidMethod(frag, "T3");
+            hookVoidMethod(frag, "R3");
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    frag,
+                    "S3",
+                    boolean.class,
+                    NOOP_HOOK
+                );
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    frag,
+                    "F3",
+                    boolean.class,
+                    NOOP_HOOK
+                );
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> vm = XposedHelpers.findClass(
+                "ha4",
+                lpp.classLoader
+            );
+
+            try {
+                Class<?> tc2 = XposedHelpers.findClass(
+                    "tc2",
+                    lpp.classLoader
+                );
+
+                XposedHelpers.findAndHookMethod(
+                    vm,
+                    "R",
+                    tc2,
+                    NOOP_HOOK
+                );
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    vm,
+                    "P",
+                    int.class,
+                    int.class,
+                    NOOP_HOOK
+                );
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    vm,
+                    "A",
+                    java.util.List.class,
+                    NOOP_HOOK
+                );
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookVoidMethod(
+        Class<?> clazz,
+        String name
+    ) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                clazz,
+                name,
+                NOOP_HOOK
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void blockRequest(
+        XC_MethodHook.MethodHookParam param
+    ) {
+        try {
+            if (param.args != null
+                && param.args.length > 0) {
+                XposedHelpers.callMethod(
+                    param.args[0],
+                    "onFailure",
+                    param.thisObject,
+                    new IOException(TAG + " blocked")
+                );
+            }
+        } catch (Throwable ignored) {
+        }
+
+        param.setResult(null);
+    }
+
+    private static String getUrlFromRequest(
+        Object request
+    ) {
+        if (request == null) {
+            return null;
+        }
+
+        try {
+            String text = request.toString();
+
+            if (text == null) {
+                return null;
+            }
+
+            int start = text.indexOf("url=");
+
+            if (start < 0) {
+                return null;
+            }
+
+            int end = text.indexOf(
+                ", ",
+                start
+            );
+
+            if (end < 0) {
+                end = text.length();
+            }
+
+            String url =
+                text.substring(
+                    start + 4,
+                    end
+                );
+
+            return url.startsWith("http")
+                ? url
+                : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String getUrlFromRealCall(
+        Object call
+    ) {
+        if (call == null) {
+            return null;
+        }
+
+        try {
+            Object request =
+                XposedHelpers.callMethod(
+                    call,
+                    "request"
+                );
+
+            String url =
+                getUrlFromRequest(request);
+
+            if (url != null) {
+                return url;
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Object request =
+                XposedHelpers.getObjectField(
+                    call,
+                    "originalRequest"
+                );
+
+            return getUrlFromRequest(request);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+}
 
         final XC_MethodHook hook = new XC_MethodHook() {
             @Override
