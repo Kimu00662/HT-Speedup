@@ -58,18 +58,13 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     /*
      * 主界面 MainTabV3Activity 是否已经进入过前台。
-     *
-     * false：第一次冷启动
-     * true：主界面已经显示过，后续 SplashAdActivity 属于热恢复
      */
     private static final AtomicBoolean MAIN_ACTIVITY_WAS_RESUMED =
         new AtomicBoolean(false);
 
     /*
-     * 是否连冷启动的广告 Splash 也一起跳过。
-     *
-     * false：冷启动保留广告 Splash（默认，符合你的要求）
-     * true：冷启动也跳过，进入主界面更快，但不会显示广告开屏
+     * false：冷启动保留广告 Splash
+     * true：冷启动也跳过广告 Splash
      */
     private static final boolean SKIP_COLD_SPLASH_AD = false;
 
@@ -105,25 +100,16 @@ public class HookEntry implements IXposedHookLoadPackage {
     /**
      * 核心修复。
      *
-     * 逆向日志证明：
-     *
-     * 热恢复时 HelloTalk 会重新启动广告 Splash 页：
+     * 热恢复时 HelloTalk 会重新启动：
      *
      * com.hellotalk.lib.ad.core.display.splash.SplashAdActivity
      *
-     * 流程：
-     * MainTabV3Activity.onResume
-     *     -> 启动 SplashAdActivity
-     *     -> MainTabV3Activity.onPause
-     *     -> SplashAdActivity 显示约 1.2 秒
-     *     -> SplashAdActivity.onPause
-     *     -> MainTabV3Activity.onResume
+     * 广告没加载出来时，它显示默认 HelloTalk 大图标，
+     * 并停留约 1.2 秒，导致无法操作。
      *
-     * 广告没加载出来时，SplashAdActivity 显示默认 HelloTalk 大图标。
-     *
-     * 处理：
-     * 主界面已经进入过前台以后，SplashAdActivity 再创建时直接 finish。
-     * 冷启动时保留，不影响正常启动流程。
+     * 这里在主界面已经进入过前台以后，对 SplashAdActivity
+     * 调用 finish()，让它不显示。注意不能跳过 super.onCreate()，
+     * 否则会触发 SuperNotCalledException 崩溃。
      */
     private void hookSkipSplashAd(
         XC_LoadPackage.LoadPackageParam lpp
@@ -162,7 +148,11 @@ public class HookEntry implements IXposedHookLoadPackage {
             );
 
             /*
-             * 热恢复时跳过 SplashAdActivity。
+             * 热恢复时结束 SplashAdActivity。
+             *
+             * 关键：只调用 finish()，不能 param.setResult(null)。
+             * 否则原 onCreate 不执行，super.onCreate() 不会被调用，
+             * 系统会抛 SuperNotCalledException。
              */
             XposedHelpers.findAndHookMethod(
                 splashAdActivity,
@@ -194,21 +184,16 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                             activity.finish();
 
-                            /*
-                             * 跳过原始 onCreate，避免它继续初始化广告。
-                             */
-                            param.setResult(null);
-
                             XposedBridge.log(
                                 TAG
                                     + (hotResume
-                                        ? " 热恢复：已跳过 SplashAdActivity"
-                                        : " 已跳过 SplashAdActivity")
+                                        ? " 热恢复：已结束 SplashAdActivity"
+                                        : " 已结束 SplashAdActivity")
                             );
                         } catch (Throwable t) {
                             XposedBridge.log(
                                 TAG
-                                    + " 跳过 SplashAdActivity 失败: "
+                                    + " 结束 SplashAdActivity 失败: "
                                     + t.getMessage()
                             );
                         }
