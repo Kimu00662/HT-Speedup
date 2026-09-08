@@ -70,9 +70,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log(TAG + " ===== 诊断模块开始加载 =====");
+        XposedBridge.log(TAG + " ===== 诊断模块V2开始加载 =====");
 
-        hookDiagnostics(lpp);
+        hookActivityDiagnostics(lpp);
         hookUserInfoProviderLoad(lpp);
         hookNetworkTimeoutToastSuppression(lpp);
         hookTitleController(lpp);
@@ -81,179 +81,166 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookRealCall(lpp);
         hookChatPage(lpp);
 
-        XposedBridge.log(TAG + " ===== 诊断钩子安装完成 =====");
+        XposedBridge.log(TAG + " ===== 诊断V2钩子安装完成 =====");
     }
 
     /**
-     * 诊断核心。
+     * 全局 Hook android.app.Activity 的生命周期。
      *
-     * 目标：测量后台切回时，到底卡在哪个阶段。
+     * MainTabV3Activity 自己没有定义 onPause/onStop/
+     * onWindowFocusChanged，所以之前精确 Hook 失败。
+     *
+     * 这里直接 Hook Activity 基类，只打印 HelloTalk 相关 Activity。
      */
-    private void hookDiagnostics(
+    private void hookActivityDiagnostics(
         XC_LoadPackage.LoadPackageParam lpp
     ) {
         try {
-            final Class<?> mainActivity = XposedHelpers.findClass(
-                "com.hellotalk.lib.main.home.ui.MainTabV3Activity",
+            final Class<?> activityClass = XposedHelpers.findClass(
+                "android.app.Activity",
                 lpp.classLoader
             );
 
-            final Class<?> launchActivity = XposedHelpers.findClass(
-                "com.hellotalk.lib.main.launch.ui.LaunchActivity",
-                lpp.classLoader
+            XC_MethodHook logHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(
+                    MethodHookParam param
+                ) {
+                    String name = activityName(param);
+
+                    if (name == null) {
+                        return;
+                    }
+
+                    String method = methodName(param);
+
+                    Object arg = null;
+
+                    if (param.args != null
+                        && param.args.length > 0) {
+                        arg = param.args[0];
+                    }
+
+                    XposedBridge.log(
+                        TAG
+                            + " ["
+                            + System.currentTimeMillis()
+                            + "] "
+                            + name
+                            + "."
+                            + method
+                            + " 开始 arg="
+                            + arg
+                    );
+                }
+
+                @Override
+                protected void afterHookedMethod(
+                    MethodHookParam param
+                ) {
+                    String name = activityName(param);
+
+                    if (name == null) {
+                        return;
+                    }
+
+                    String method = methodName(param);
+
+                    Object arg = null;
+
+                    if (param.args != null
+                        && param.args.length > 0) {
+                        arg = param.args[0];
+                    }
+
+                    XposedBridge.log(
+                        TAG
+                            + " ["
+                            + System.currentTimeMillis()
+                            + "] "
+                            + name
+                            + "."
+                            + method
+                            + " 结束 arg="
+                            + arg
+                    );
+                }
+            };
+
+            XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onResume",
+                logHook
             );
 
-            /*
-             * MainTabV3Activity 生命周期时间戳。
-             */
-            hookTime(mainActivity, "onCreate",
-                new String[]{"android.os.Bundle"});
-            hookTime(mainActivity, "onStart", null);
-            hookTime(mainActivity, "onResume", null);
-            hookTime(mainActivity, "onPause", null);
-            hookTime(mainActivity, "onStop", null);
-            hookTime(mainActivity, "onWindowFocusChanged",
-                new String[]{"boolean"});
+            XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onPause",
+                logHook
+            );
 
-            /*
-             * LaunchActivity 生命周期时间戳。
-             *
-             * 用于确认切回时 LaunchActivity 是否被重新创建。
-             */
-            hookTime(launchActivity, "onCreate",
-                new String[]{"android.os.Bundle"});
-            hookTime(launchActivity, "onResume", null);
-            hookTime(launchActivity, "onPause", null);
-            hookTime(launchActivity, "onWindowFocusChanged",
-                new String[]{"boolean"});
+            XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onStop",
+                logHook
+            );
 
-            XposedBridge.log(TAG + " 生命周期诊断钩子安装成功");
+            XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onWindowFocusChanged",
+                boolean.class,
+                logHook
+            );
+
+            XposedBridge.log(
+                TAG + " Activity 全局生命周期诊断安装成功"
+            );
         } catch (Throwable t) {
             XposedBridge.log(
-                TAG + " 生命周期诊断钩子安装失败: "
+                TAG + " Activity 全局生命周期诊断失败: "
                     + t.getMessage()
             );
         }
     }
 
-    private void hookTime(
-        final Class<?> clazz,
-        final String methodName,
-        final String[] paramTypes
+    private static String activityName(
+        XC_MethodHook.MethodHookParam param
     ) {
         try {
-            Object[] paramsAndHook = null;
+            Object activity = param.thisObject;
 
-            if (paramTypes == null) {
-                XposedHelpers.findAndHookMethod(
-                    clazz,
-                    methodName,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 开始"
-                            );
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 结束"
-                            );
-                        }
-                    }
-                );
-            } else if ("boolean".equals(paramTypes[0])) {
-                XposedHelpers.findAndHookMethod(
-                    clazz,
-                    methodName,
-                    boolean.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 开始 hasFocus="
-                                    + param.args[0]
-                            );
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 结束 hasFocus="
-                                    + param.args[0]
-                            );
-                        }
-                    }
-                );
-            } else {
-                XposedHelpers.findAndHookMethod(
-                    clazz,
-                    methodName,
-                    android.os.Bundle.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 开始"
-                            );
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(
-                            MethodHookParam param
-                        ) {
-                            logTime(
-                                clazz.getSimpleName()
-                                    + "." + methodName
-                                    + " 结束"
-                            );
-                        }
-                    }
-                );
+            if (activity == null) {
+                return null;
             }
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG
-                    + " 无法 hook "
-                    + clazz.getSimpleName()
-                    + "."
-                    + methodName
-                    + ": "
-                    + t.getMessage()
-            );
+
+            String name = activity.getClass().getName();
+
+            if (name == null) {
+                return null;
+            }
+
+            if (name.startsWith("com.hellotalk.")) {
+                return name;
+            }
+
+            return null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
-    private static void logTime(String message) {
-        XposedBridge.log(
-            TAG
-                + " ["
-                + System.currentTimeMillis()
-                + "] "
-                + message
-        );
+    private static String methodName(
+        XC_MethodHook.MethodHookParam param
+    ) {
+        try {
+            if (param.method != null) {
+                return param.method.getName();
+            }
+
+            return "?";
+        } catch (Throwable ignored) {
+            return "?";
+        }
     }
 
     private void hookNetworkTimeoutToastSuppression(
@@ -299,11 +286,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(
                 TAG + " hook gm6.o 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG + " hook gm6.o 失败: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
@@ -380,11 +363,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(
                 TAG + " hook UserInfoProvider.b() 成功"
             );
-        } catch (Throwable t) {
-            XposedBridge.log(
-                TAG + " hook UserInfoProvider 失败: "
-                    + t.getMessage()
-            );
+        } catch (Throwable ignored) {
         }
     }
 
