@@ -41,12 +41,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile long lastToUserChatTs = 0;
     private static final long TO_USER_CHAT_DEDUP_MS = 10_000;
 
-    // 记住当前聊天的 userId
     private static final ThreadLocal<Integer> CHAT_USER_ID = new ThreadLocal<>();
 
-    // userinfo 查询去重：userId -> 上次查询时间
     private static final ConcurrentHashMap<Integer, Long> userinfoQueryRecord = new ConcurrentHashMap<>();
-    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;  // 20秒内不重复查同一用户
+    private static final long USERINFO_QUERY_INTERVAL_MS = 20_000;
 
     private static final XC_MethodHook NOOP_HOOK = new XC_MethodHook() {
         @Override
@@ -62,9 +60,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
-        hookUserInfoProviderLoad(lpp);      // 秒进的关键
-        hookNetworkTimeoutToastSuppression(lpp);  // 屏蔽“网络超时”黑框
-        hookLaunchSplash(lpp);              // ← 新增：隐藏启动大图标
+        hookUserInfoProviderLoad(lpp);
+        hookNetworkTimeoutToastSuppression(lpp);
+        hookLaunchSplash(lpp);
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -89,9 +87,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     /**
-     * 屏蔽“网络超时，请重试 / 網絡超時，請重試 / ネットワークが途絶えました…”黑框。
-     * 三条文案是同一资源 ID：0x7f141387（network_timed_out_retry）。
-     * 统一出口：gm6.o(int resId, Context)。
+     * 屏蔽“网络超时”黑框。
+     * 三条文案同一资源 ID：0x7f141387，统一出口 gm6.o(int, Context)。
      */
     private void hookNetworkTimeoutToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
         try {
@@ -120,17 +117,32 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     /**
-     * 隐藏启动页 HelloTalk 大图标。
-     * LaunchActivity.o0() = inflateLaunchContent，填充 logo 布局后把 logo View 存到：
-     *   B = FrameLayout（logo 容器）
-     *   C = ImageView（大图标）
-     * 在这里把它们设为 GONE，启动页就不显示大图标，后续主流程不受影响。
+     * 干掉启动大图标。
+     * 大图标不是布局里的 ImageView，而是 LaunchActivity 主题的 windowBackground：
+     *   android:windowBackground = @drawable/splash_screen_only_ht_logo_bg
+     * 所以要在 onCreate 最开始时把窗口背景替换成纯色。
+     * 同时隐藏布局里的 logo View 作为双保险。
      */
     private void hookLaunchSplash(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> launchActivity = XposedHelpers.findClass(
                 "com.hellotalk.lib.main.launch.ui.LaunchActivity", lpp.classLoader);
 
+            // 1) 在 onCreate 最开始替换窗口背景（去掉 HelloTalk 大图标）
+            XposedBridge.hookAllMethods(launchActivity, "onCreate", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        android.app.Activity act = (android.app.Activity) param.thisObject;
+                        act.getWindow().setBackgroundDrawable(
+                            new android.graphics.drawable.ColorDrawable(0xFFFFFFFF));
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+
+            // 2) 隐藏布局里的 logo View（双保险）
             XposedBridge.hookAllMethods(launchActivity, "o0", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -147,39 +159,34 @@ public class HookEntry implements IXposedHookLoadPackage {
                             ((android.view.View) logoImage).setVisibility(android.view.View.GONE);
                         }
 
-                        XposedBridge.log(TAG + " 已隐藏启动大图标");
+                        XposedBridge.log(TAG + " 已隐藏启动大图标 View");
                     } catch (Throwable t) {
                         // ignored
                     }
                 }
             });
 
-            XposedBridge.log(TAG + " hook LaunchActivity.o0 启动大图标隐藏成功");
+            XposedBridge.log(TAG + " hook LaunchActivity 启动大图标隐藏成功");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " hook LaunchActivity.o0 失败: " + t.getMessage());
+            XposedBridge.log(TAG + " hook LaunchActivity 失败: " + t.getMessage());
         }
     }
 
-    // ★ 秒进的核心：hook Lyrv.b()，判断本地缓存充分就直接返回，不走协程查询
     private void hookUserInfoProviderLoad(XC_LoadPackage.LoadPackageParam lpp) {
         try {
             Class<?> yrvClass = XposedHelpers.findClass("yrv", lpp.classLoader);
 
-            // hook b(int userId, List fields, int mode, orv callback, r06 continuation)
             XposedBridge.hookAllMethods(yrvClass, "b", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     try {
-                        // 参数: args[0]=userId, args[1]=fields, args[2]=mode, args[3]=callback, args[4]=continuation
                         if (param.args == null || param.args.length < 5) return;
 
                         Object userIdObj = param.args[0];
                         if (!(userIdObj instanceof Integer)) return;
                         int userId = (Integer) userIdObj;
 
-                        // 检查本地缓存是否充分
                         if (hasEnoughCache(yrvClass, userId)) {
-                            // 本地缓存充分，直接返回缓存对象，不启动协程
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -188,11 +195,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
                         }
 
-                        // 缓存不足，让原方法走协程查询，但限制去重
                         long now = System.currentTimeMillis();
                         Long lastQuery = userinfoQueryRecord.get(userId);
                         if (lastQuery != null && now - lastQuery < USERINFO_QUERY_INTERVAL_MS) {
-                            // 20秒内已查过，跳过网络查询，用缓存返回
                             Object cachedData = getCachedUserInfo(yrvClass, userId);
                             if (cachedData != null) {
                                 param.setResult(cachedData);
@@ -214,33 +219,26 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    // 检查本地缓存是否充分（有 UserBaseInfo 和 UserOnline）
     private static boolean hasEnoughCache(Class<?> yrvClass, int userId) {
         try {
-            // 获取 Lyrv 单例
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
             if (provider == null) return false;
 
-            // 读 Lyrv.d (内存缓存 w1i)
             Object cache = XposedHelpers.getObjectField(provider, "d");
             if (cache == null) return false;
 
-            // 查缓存里有没有这个 userId 的数据
             Object cachedData = XposedHelpers.callMethod(cache, "c", (Integer) userId);
             if (cachedData == null) return false;
 
-            // 检查 UserInfoModel 里是否有必要字段
-            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");  // UserBaseInfo
-            Object userOnline = XposedHelpers.callMethod(cachedData, "u");  // UserOnline
+            Object baseInfo = XposedHelpers.callMethod(cachedData, "d");
+            Object userOnline = XposedHelpers.callMethod(cachedData, "u");
 
-            // 都有就认为缓存充分
             return baseInfo != null && userOnline != null;
         } catch (Throwable t) {
             return false;
         }
     }
 
-    // 从本地缓存取 UserInfoModel
     private static Object getCachedUserInfo(Class<?> yrvClass, int userId) {
         try {
             Object provider = XposedHelpers.getStaticObjectField(yrvClass, "a");
