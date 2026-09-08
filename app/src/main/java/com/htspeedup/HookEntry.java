@@ -62,8 +62,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + " ===== 模块开始加载 =====");
 
         hookApplication(lpp);
-        hookUserInfoProviderLoad(lpp);      // ← 这是秒进的关键
-        hookNetworkTimeoutToastSuppression(lpp);  // ← 新增：屏蔽“网络超时”黑框
+        hookUserInfoProviderLoad(lpp);      // 秒进的关键
+        hookNetworkTimeoutToastSuppression(lpp);  // 屏蔽“网络超时”黑框
+        hookLaunchSplash(lpp);              // ← 新增：隐藏启动大图标
         hookTitleController(lpp);
         hookChatDetailFragment(lpp);
         hookNewCall(lpp);
@@ -89,9 +90,8 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     /**
      * 屏蔽“网络超时，请重试 / 網絡超時，請重試 / ネットワークが途絶えました…”黑框。
-     * 这三条文案是同一个资源 ID：0x7f141387（network_timed_out_retry）。
-     * HelloTalk 统一通过 gm6.o(int resId, Context) 显示这个黑框（内部走 SimpleToast）。
-     * 只拦截 resId == 0x7f141387，不影响其它任何提示。
+     * 三条文案是同一资源 ID：0x7f141387（network_timed_out_retry）。
+     * 统一出口：gm6.o(int resId, Context)。
      */
     private void hookNetworkTimeoutToastSuppression(XC_LoadPackage.LoadPackageParam lpp) {
         try {
@@ -116,6 +116,47 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " hook gm6.o 网络超时黑框拦截成功");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hook gm6.o 失败: " + t.getMessage());
+        }
+    }
+
+    /**
+     * 隐藏启动页 HelloTalk 大图标。
+     * LaunchActivity.o0() = inflateLaunchContent，填充 logo 布局后把 logo View 存到：
+     *   B = FrameLayout（logo 容器）
+     *   C = ImageView（大图标）
+     * 在这里把它们设为 GONE，启动页就不显示大图标，后续主流程不受影响。
+     */
+    private void hookLaunchSplash(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            Class<?> launchActivity = XposedHelpers.findClass(
+                "com.hellotalk.lib.main.launch.ui.LaunchActivity", lpp.classLoader);
+
+            XposedBridge.hookAllMethods(launchActivity, "o0", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object activity = param.thisObject;
+
+                        Object logoContainer = XposedHelpers.getObjectField(activity, "B");
+                        if (logoContainer instanceof android.view.View) {
+                            ((android.view.View) logoContainer).setVisibility(android.view.View.GONE);
+                        }
+
+                        Object logoImage = XposedHelpers.getObjectField(activity, "C");
+                        if (logoImage instanceof android.view.View) {
+                            ((android.view.View) logoImage).setVisibility(android.view.View.GONE);
+                        }
+
+                        XposedBridge.log(TAG + " 已隐藏启动大图标");
+                    } catch (Throwable t) {
+                        // ignored
+                    }
+                }
+            });
+
+            XposedBridge.log(TAG + " hook LaunchActivity.o0 启动大图标隐藏成功");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " hook LaunchActivity.o0 失败: " + t.getMessage());
         }
     }
 
